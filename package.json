@@ -42,7 +42,8 @@
   ],
   "license": "MIT",
   "os": [
-    "darwin"
+    "darwin",
+    "win32"
   ],
   "author": "Vitaliy Hayda (https://github.com/vitaliyhayda)"
 }

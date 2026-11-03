@@ -8,13 +8,14 @@ import { syncBuiltinESMExports } from 'node:module'
 import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { promisify } from 'node:util'
-import { accounts, cloudClient, conversation, conversationMatch, executeMove, finishHeld, finishPending, finishWorkflow, idleTimeouts, inventory, keepLocal, layout, memoryBudget, menubarHeapMiB, move, normalize, parseProcesses, pendingPresentation, readReceipt, receiptSummary, restartPlan, semantic, signedIn, step, sweep, undo, verifyPlaced, withDesktopRestart, writeNew } from './transplant.js'
+import { accounts, cloudClient, conversation, conversationMatch, executeMove, finishHeld, finishPending, finishWorkflow, idleTimeouts, inventory, keepLocal, layout, memoryBudget, menubarHeapMiB, move, normalize, parseProcesses, parseWindowsProcesses, pendingPresentation, quitCommand, readReceipt, receiptSummary, restartPlan, semantic, signedIn, step, sweep, undo, verifyPlaced, windowsLockHelper, withDesktopRestart, writeNew } from './transplant.js'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const fixtureCommand = run => (file, ...args) => {
   if (file === '/usr/bin/security') return { status: 1, stdout: '', stderr: 'fixture login unavailable' }
+  if (/Win32_Process/.test(args[0]?.at?.(-1) ?? '')) return { status: 0, stdout: '[]', stderr: '' }
   if (['/usr/bin/osascript', '/usr/bin/open', '/bin/launchctl', 'launchctl', 'pkill'].includes(file)) throw new Error('fixture native command requires a mock')
   return run(file, ...args)
 }
@@ -74,7 +75,13 @@ async function moveWithPending(h, from, to, cloud = null) {
 const branchEntries = (count, session, start) => Array.from({ length: count }, (_, index) => entry(index % 2 ? 'assistant' : 'user', start + index, index ? start + index - 1 : null, session))
 const processSetup = processes => `
   const processes = ${JSON.stringify(processes)}, run = childProcess.spawnSync
-  childProcess.spawnSync = (file, args, ...rest) => file === '/bin/ps' ? { status: 0, stdout: processes[args[1].endsWith('command=') ? 'commands' : 'list'], stderr: '' } : run(file, args, ...rest)
+  const identity = /^\\s*(\\d+)\\s+(\\d+)\\s+(\\w{3}\\s+\\w{3}\\s+\\d+\\s+\\d+:\\d+:\\d+\\s+\\d{4})\\s+(.+)$/
+  const rows = text => text.split('\\n').filter(line => line.trim()).map(line => line.match(identity))
+  const commandLines = new Map(rows(processes.commands).map(match => [match[1] + '/' + match[3], match[4]]))
+  const windowsTable = JSON.stringify(rows(processes.list).map(match => ({ ProcessId: Number(match[1]), ParentProcessId: Number(match[2]),
+    Created: String((BigInt(Date.parse(match[3])) + 11644473600000n) * 10000n), ExecutablePath: match[4].trim(), CommandLine: commandLines.get(match[1] + '/' + match[3]) ?? null })))
+  childProcess.spawnSync = (file, args, ...rest) => file === '/bin/ps' ? { status: 0, stdout: processes[args[1].endsWith('command=') ? 'commands' : 'list'], stderr: '' }
+    : /Win32_Process/.test(args?.at(-1) ?? '') ? { status: 0, stdout: windowsTable, stderr: '' } : run(file, args, ...rest)
 `
 const cli = (home, args, setup = '') => promisify(execFile)(process.execPath, ['--input-type=module', '-e', `
   import childProcess from 'node:child_process'
@@ -84,9 +91,9 @@ const cli = (home, args, setup = '') => promisify(execFile)(process.execPath, ['
   ${setup}
   syncBuiltinESMExports()
   process.argv.splice(1, 0, ${JSON.stringify(path.join(here, 'transplant.js'))})
-  await import(${JSON.stringify(path.join(here, 'transplant.js'))})
+  await import(${JSON.stringify(pathToFileURL(path.join(here, 'transplant.js')).href)})
 `, '--', ...args], {
-  env: { ...process.env, HOME: home },
+  env: { ...process.env, HOME: home, USERPROFILE: home },
   cwd: here
 }).then((r) => ({ ...r, code: 0 }), (e) => ({ stdout: e.stdout, stderr: e.stderr, code: e.code }))
 const touchPlaced = file => {
@@ -134,7 +141,63 @@ test('process identity separates Desktop descendants, external workers, and reus
   assert.equal(alternate.find((row) => row.pid === 12).desktopPid, 10)
 })
 
-test('process inventory handles more than one megabyte of unrelated argv', async () => {
+test('layout places Claude Desktop and transplant state per platform inside the given home', () => {
+  const mac = layout('/Users/fixture', 'darwin')
+  assert.equal(mac.records, path.join('/Users/fixture', 'Library/Application Support/Claude/claude-code-sessions'))
+  assert.equal(mac.claudeApp, '/Applications/Claude.app')
+  const home = 'C:\\Users\\fixture', roaming = path.join(home, 'AppData', 'Roaming')
+  const windows = layout(home, 'win32')
+  assert.deepEqual({ records: windows.records, agentSessions: windows.agentSessions, desktop: windows.desktop, logs: windows.logs, cookies: windows.cookies, localState: windows.localState, state: windows.state, pool: windows.pool, login: windows.login },
+    { records: path.join(roaming, 'Claude', 'claude-code-sessions'), agentSessions: path.join(roaming, 'Claude', 'local-agent-mode-sessions'), desktop: path.join(roaming, 'Claude', 'config.json'),
+      logs: path.join(home, 'AppData', 'Local', 'Claude', 'Logs'), cookies: path.join(roaming, 'Claude', 'Network', 'Cookies'), localState: path.join(roaming, 'Claude', 'Local State'),
+      state: path.join(roaming, 'claude-transplant'), pool: path.join(home, '.claude', 'projects'), login: path.join(home, '.claude.json') })
+  assert.equal(windows.claudeApp, 'shell:AppsFolder\\Claude_pzs8sxrjxfjjc!Claude')
+})
+
+test('Windows process identity separates Desktop helpers, descendants, external workers, and reused pids', () => {
+  const desktop = 'C:\\Program Files\\WindowsApps\\Claude_4.4212.0.0_x64__pzs8sxrjxfjjc\\app\\claude.exe'
+  const worker = 'C:\\Users\\fixture\\AppData\\Roaming\\Claude\\claude-code\\2.1.309\\9078b9c1d466\\claude.exe'
+  const ticks = '134381959746885920', registeredTicks = '134381959746885928', laterTicks = '134381959756885920'
+  const table = JSON.stringify([
+    { ProcessId: 10, ParentProcessId: 1, Created: ticks, ExecutablePath: desktop, CommandLine: `"${desktop}"` },
+    { ProcessId: 11, ParentProcessId: 10, Created: ticks, ExecutablePath: desktop, CommandLine: `"${desktop}" --type=renderer --session=${id(9)}` },
+    { ProcessId: 12, ParentProcessId: 10, Created: ticks, ExecutablePath: worker, CommandLine: `"${worker}" --resume ${id(2)}` },
+    { ProcessId: 13, ParentProcessId: 1, Created: ticks, ExecutablePath: worker, CommandLine: `"${worker}" --resume ${id(3)}` },
+    { ProcessId: 14, ParentProcessId: 10, Created: laterTicks, ExecutablePath: worker, CommandLine: `"${worker}"` },
+    { ProcessId: 15, ParentProcessId: 10, Created: ticks, ExecutablePath: worker, CommandLine: `"${worker}"` },
+    { ProcessId: 16, ParentProcessId: 1, Created: ticks, ExecutablePath: null, CommandLine: null }
+  ])
+  const registrations = [
+    { pid: 14, pidDomain: 'win32:fixture-host', procStart: registeredTicks, sessionId: SOURCE },
+    { pid: 15, pidDomain: 'win32:other-host', procStart: registeredTicks, sessionId: id(5) },
+    { pid: 12, pidDomain: 'win32:FIXTURE-HOST', procStart: registeredTicks, sessionId: id(4), cwd: 'C:\\work', name: 'named' }
+  ]
+  const rows = parseWindowsProcesses(table, registrations, 'Fixture-Host')
+  const row = (pid) => rows.find((item) => item.pid === pid)
+  assert.equal(row(10).desktopPid, 10)
+  assert.equal(row(11).worker, false)
+  assert.deepEqual(row(11).ids, [id(9)])
+  assert.equal(row(12).worker, true)
+  assert.equal(row(12).desktopPid, 10)
+  assert.deepEqual(row(12).ids, [id(2), id(4)])
+  assert.equal(row(12).cwd, 'C:\\work')
+  assert.equal(row(12).sessionName, 'named')
+  assert.equal(row(13).desktopPid, null)
+  assert.deepEqual(row(14).ids, [])
+  assert.deepEqual(row(15).ids, [])
+  assert.equal(row(16).worker, false)
+  assert.equal(row(12).started, '2026-11-03T16:12:54.688Z')
+  assert.equal(Date.parse(row(12).started), Date.parse(row(10).started))
+  assert.deepEqual(parseWindowsProcesses(JSON.stringify(JSON.parse(table)[0]), [], 'fixture-host').map((item) => item.pid), [10])
+  assert.deepEqual(parseWindowsProcesses('', [], 'fixture-host'), [])
+  assert.throws(() => parseWindowsProcesses('not json', [], 'fixture-host'), /process identity/)
+  const squirrel = 'C:\\Users\\fixture\\AppData\\Local\\AnthropicClaude\\app-1.0.0\\claude.exe'
+  const installed = parseWindowsProcesses(JSON.stringify([{ ProcessId: 20, ParentProcessId: 1, Created: ticks, ExecutablePath: squirrel, CommandLine: squirrel },
+    { ProcessId: 21, ParentProcessId: 20, Created: ticks, ExecutablePath: worker, CommandLine: worker }]), [], 'fixture-host')
+  assert.equal(installed.find((item) => item.pid === 21).desktopPid, 20)
+})
+
+test('process inventory handles more than one megabyte of unrelated argv', { skip: process.platform === 'win32' && 'exercises the macOS ps listing' }, async () => {
   const h = await home()
   const children = Array.from({ length: 9 }, () => spawn('/usr/bin/python3', ['-c', 'import time; time.sleep(30)', 'x'.repeat(120 * 1024)], { stdio: 'ignore' }))
   try {
@@ -175,6 +238,9 @@ test('inventory recognizes a live Desktop record id before its CLI uuid enters a
   assert.match(inv.blocked[0].error, /running worker/)
 })
 
+const nativeDesktop = process.platform === 'win32' ? 'C:\\Program Files\\WindowsApps\\Claude_4.4212.0.0_x64__pzs8sxrjxfjjc\\app\\claude.exe' : '/Applications/Claude.app/Contents/MacOS/Claude'
+const nativeOpen = process.platform === 'win32' ? /\\powershell\.exe$/i : /^\/usr\/bin\/open$/
+const nativeDesktopFixture = () => ({ ...desktopFixture()[0], executable: nativeDesktop })
 const desktopFixture = (session = SOURCE) => [
   { pid: 500, ppid: 1, started: 'first', executable: '/Applications/Claude.app/Contents/MacOS/Claude', ids: [], worker: true, desktopPid: 500 },
   { pid: 501, ppid: 500, started: 'worker', executable: '/tmp/claude', ids: [session], worker: true, desktopPid: 500 }
@@ -320,6 +386,48 @@ test('long closed work gets a fresh bounded reopen wait', async () => {
   assert.equal(lines(await readFile(path.join(h.paths.state, 'restart-events.jsonl'), 'utf8')).at(-1).stopCode, 'NO_WORK')
 })
 
+test('a Windows Desktop restart closes through Restart Manager and reopens its own install', async () => {
+  const store = 'C:\\Program Files\\WindowsApps\\Claude_4.4212.0.0_x64__pzs8sxrjxfjjc\\app\\claude.exe'
+  const installed = 'C:\\Users\\fixture\\AppData\\Local\\AnthropicClaude\\app-1.0.0\\claude.exe'
+  for (const [executable, app] of [[store, 'shell:AppsFolder\\Claude_pzs8sxrjxfjjc!Claude'], [installed, installed]]) {
+    const h = await home()
+    const desktop = (pid, started) => ({ ...desktopFixture()[0], pid, desktopPid: pid, started, executable })
+    let rows = [desktop(500, '2026-11-03T16:12:54.688Z'), { ...desktopFixture()[1], executable: 'C:\\Users\\fixture\\AppData\\Roaming\\Claude\\claude-code\\2.1.309\\x\\claude.exe' }]
+    const plan = await restartPlan(null, h.paths, rows), calls = []
+    assert.equal(plan.app, app)
+    const result = await withDesktopRestart(plan, h.paths, async () => ({ ok: true }), () => {}, { inspect: () => rows, command: async (file, args) => {
+      calls.push({ file, script: args.at(-1) })
+      rows = calls.length === 1 ? [] : [desktop(700, '2026-11-03T16:20:00.000Z')]
+      return { status: 0 }
+    } })
+    assert.equal(result.restart.outcome, 'reopened')
+    assert.ok(calls.every(call => /powershell\.exe$/i.test(call.file)))
+    assert.match(calls[0].script, /RmShutdown/)
+    assert.match(calls[0].script, /-Id 500\b/)
+    assert.match(calls[0].script, /1793722374688/)
+    assert.equal(calls[1].script, `Start-Process '${app}'`)
+  }
+})
+
+test('the Windows quit asks only the exact planned process to close', { skip: process.platform !== 'win32' }, async () => {
+  const app = 'shell:AppsFolder\\Claude_fixture!Claude', shell = quitCommand(app, { pid: 0, started: '' })[0]
+  const form = spawn(shell, ['-NoProfile', '-NonInteractive', '-Command', "Add-Type -AssemblyName System.Windows.Forms; $form = New-Object System.Windows.Forms.Form; $form.ShowInTaskbar = $false; $form.WindowState = 'Minimized'; $form.Add_Shown({ [Console]::Out.Write('ready'); [Console]::Out.Flush() }); [System.Windows.Forms.Application]::Run($form)"], { stdio: ['ignore', 'pipe', 'pipe'] })
+  try {
+    await once(form.stdout, 'data')
+    const started = Number(spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', `[DateTimeOffset]::new((Get-Process -Id ${form.pid}).StartTime).ToUnixTimeMilliseconds()`], { encoding: 'utf8' }).stdout.trim())
+    const reused = quitCommand(app, { pid: form.pid, started: new Date(started - 1000).toISOString() })
+    assert.equal(spawnSync(...reused).status, 3)
+    assert.equal(form.exitCode, null)
+    const exited = once(form, 'exit')
+    const planned = quitCommand(app, { pid: form.pid, started: new Date(started).toISOString() })
+    const quit = spawnSync(...planned, { encoding: 'utf8' })
+    assert.equal(quit.status, 0, quit.stderr)
+    await exited
+  } finally {
+    if (form.exitCode === null) form.kill()
+  }
+})
+
 test('a journal failure after quit cannot prevent the reopen request', async () => {
   const h = await home()
   let rows = desktopFixture()
@@ -414,9 +522,10 @@ test('recovery reopens an interrupted approved restart without requesting anothe
   await writeFile(path.join(h.paths.state, 'restart.json'), JSON.stringify({ outcome: 'moving', desktop: { pid: 500, started: 'first' } }))
   let rows = [], calls = []
   const result = await sweep(h.paths, { io: {
-    inspect: () => rows, command: async (file) => { calls.push(file); rows = desktopFixture(); return { status: 0 } }
+    inspect: () => rows, command: async (file) => { calls.push(file); rows = [{ ...desktopFixture()[0], executable: nativeDesktop }]; return { status: 0 } }
   } })
-  assert.deepEqual(calls, ['/usr/bin/open'])
+  assert.equal(calls.length, 1)
+  assert.match(calls[0], nativeOpen)
   assert.equal(result.recovered.title, 'Interrupted restart')
   assert.equal(JSON.parse(await readFile(path.join(h.paths.state, 'restart.json'))).outcome, 'interrupted-reopened')
 })
@@ -699,7 +808,9 @@ test('automatic retries never request a restart and leave held workers alone', a
 })
 
 async function hold(file, native = false) {
-  const command = native
+  const command = process.platform === 'win32'
+    ? windowsLockHelper(file)
+    : native
     ? ['/usr/bin/lockf', '-k', '-t', '0', file, '/bin/sh', '-c', 'printf ready; cat >/dev/null']
     : ['/usr/bin/perl', '-MFcntl=:flock', '-e', 'open(my $lock, ">>", $ARGV[0]) or die $!; flock($lock, LOCK_EX) or die $!; $| = 1; print "ready"; 1 while <STDIN>;', file]
   const guard = spawn(command[0], command.slice(1), { stdio: ['pipe', 'pipe', 'pipe'] })
@@ -1210,6 +1321,21 @@ test('native and fallback helpers share the kernel lock and release it after a m
     assert.equal(undone.code, 0, undone.stderr)
     assert.equal((await readdir(h.dir('P'))).length, 1)
   }
+})
+
+test('the Windows lock helper refuses a second holder and releases when its holder exits', { skip: process.platform !== 'win32' }, async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'transplant-lock-'))
+  const file = path.join(dir, `it's locked`)
+  const first = await hold(file)
+  const [command, ...args] = windowsLockHelper(file)
+  const second = spawnSync(command, args, { input: '' })
+  assert.equal(second.status, 75)
+  const exited = once(first, 'exit')
+  first.stdin.end()
+  await exited
+  const third = spawnSync(command, args, { input: '' })
+  assert.equal(third.status, 0)
+  assert.equal(String(third.stdout), 'ready')
 })
 
 test('fallback lock releases after an interrupted move so recovery can run', async () => {
@@ -1767,7 +1893,7 @@ test('duplicate source records for one transcript move once and retire every own
   assert.deepEqual(await readdir(h.dir('Z')), [`local_${id(926)}.json`])
 })
 
-test('a Desktop record changing inside the final guard stays visible and undoable', async () => {
+test('a Desktop record changing inside the final guard stays visible and undoable', { skip: process.platform === 'win32' && 'needs a POSIX FIFO to pause a read' }, async () => {
   const h = await home()
   const session = id(936)
   const record = path.join(h.dir('P'), `local_${session}.json`)
@@ -1793,7 +1919,7 @@ test('a Desktop record changing inside the final guard stays visible and undoabl
   assert.equal(JSON.parse(await readFile(record, 'utf8')).title, 'changed inside final guard')
 })
 
-test('unsupported sidecar entries name the path instead of looking like drift', async () => {
+test('unsupported sidecar entries name the path instead of looking like drift', { skip: process.platform === 'win32' && 'needs a POSIX FIFO as the unsupported entry' }, async () => {
   const h = await home()
   await h.write(id(984), [entry('user', 984, null, id(984))])
   const dir = path.join(h.project, id(984))
@@ -2084,6 +2210,14 @@ test('signed-in identity survives inactivity and ignores usage, focus, and allow
   assert.deepEqual(list.filter((row) => row.active).map((row) => row.org), [h.org.P])
   assert.equal(list.filter((row) => row.account === h.acct.P).every((row) => row.signedIn), true)
   assert.equal(list.filter((row) => row.account !== h.acct.P).some((row) => row.signedIn), false)
+})
+
+test('Windows CRLF Desktop logs keep signed-in identity and idle timeouts', async () => {
+  const h = await home(), f = await identityFixture(h)
+  const idle = (offset) => f.event(offset, `[WarmLifecycle:session] Starting idle timeout for local_${SOURCE}: 300s`)
+  await f.write((f.init() + idle(5) + f.event(6, 'later')).replaceAll('\n', '\r\n'))
+  assert.deepEqual(await signedIn(h.paths, f.processes), { account: h.acct.P, org: h.org.P, state: 'known', source: 'log', at: new Date(f.started).toISOString() })
+  assert.deepEqual([...await idleTimeouts(h.paths, f.processes)], [[`local_${SOURCE}`, 300]])
 })
 
 test('signed-in identity invalidates incomplete transitions, logout, and initialization failures', async () => {
@@ -2604,13 +2738,13 @@ test('background Undo preserves its checkpoint while recovering an interrupted a
     const before = await fixtureSnapshot(h, [h.paths.records, h.paths.pool]), bytes = await readFile(f.moved.file), journalBytes = await readFile(journal), cloudCalls = f.calls.length
     const restartFile = path.join(h.paths.state, 'restart.json')
     await writeFile(restartFile, JSON.stringify({ outcome: 'moving', app: h.paths.claudeApp, receiptFile: f.moved.file, desktop: { pid: 500, started: 'prior' } }))
-    let rows = state === 'running' ? [desktopFixture()[0]] : [], calls = []
+    let rows = state === 'running' ? [nativeDesktopFixture()] : [], calls = []
     const io = { inspect: () => rows, command: async (file, args, timeout) => {
       calls.push(file)
-      assert.equal(file, '/usr/bin/open')
-      assert.deepEqual(args, ['-g', '-a', h.paths.claudeApp])
+      assert.match(file, nativeOpen)
+      assert.deepEqual(args.slice(-2), process.platform === 'win32' ? ['-Command', `Start-Process '${h.paths.claudeApp}'`] : ['-a', h.paths.claudeApp])
       assert.equal(timeout, 8000)
-      if (state !== 'failed') rows = [desktopFixture()[0]]
+      if (state !== 'failed') rows = [nativeDesktopFixture()]
       return { status: state === 'failed' ? 1 : 0 }
     } }
     if (remote && state !== 'stale receipt') {
@@ -2634,7 +2768,7 @@ test('background Undo preserves its checkpoint while recovering an interrupted a
       }
       assert.notEqual(result.complete, true)
     }
-    assert.deepEqual(calls, state === 'running' ? [] : ['/usr/bin/open'])
+    assert.equal(calls.filter(file => nativeOpen.test(file)).length, calls.length); assert.equal(calls.length, state === 'running' ? 0 : 1)
     const restart = JSON.parse(await readFile(restartFile))
     assert.equal(restart.outcome, state === 'running' ? 'interrupted-app-running' : state === 'failed' ? 'reopen-failed' : 'interrupted-reopened')
     assert.ok(restart.recoveredAt)
@@ -2644,7 +2778,7 @@ test('background Undo preserves its checkpoint while recovering an interrupted a
     assert.deepEqual(await readFile(journal), journalBytes)
     assert.deepEqual(await fixtureSnapshot(h, [h.paths.records, h.paths.pool]), before)
     assert.equal((await sweep(h.paths, { ...f.options, io })).complete, false)
-    assert.deepEqual(calls, state === 'running' ? [] : ['/usr/bin/open'])
+    assert.equal(calls.filter(file => nativeOpen.test(file)).length, calls.length); assert.equal(calls.length, state === 'running' ? 0 : 1)
     assert.deepEqual(await readFile(f.moved.file), bytes)
     assert.deepEqual(await readFile(journal), journalBytes)
   }
@@ -2733,7 +2867,7 @@ test('accounts labels a login held in a claude-acc account directory', async () 
   assert.equal(row.label, 'switched@example.com \u00b7 Switched Team')
 })
 
-test('menubar snapshot renders live accounts without installing', async () => {
+test('menubar snapshot renders live accounts without installing', { skip: process.platform === 'win32' && 'the Swift menubar is macOS only' }, async () => {
   const h = await home()
   const output = path.join(h.root, 'snapshot', 'panel.png')
   const result = await cli(h.root, ['menubar', '--snapshot', output])
@@ -6657,7 +6791,7 @@ test('resumed mixed ordinary and task work counts every newly placed record', as
 async function interruptTaskFamily(h, operation, stage) {
   const hook = stage === 'record' ? 'link' : 'rename'
   const destination = stage === 'record' ? path.join(h.dir('T'), `local_${h.notificationId ?? SOURCE}.json`) : stage === 'source' ? h.sourceFile : h.targetFile
-  const matches = ['receipt', 'retiring'].includes(stage) ? `args[1].startsWith(paths.state + '/') && JSON.parse(await fs.readFile(args[1], 'utf8')).${stage === 'retiring' ? 'retiring' : 'taskTransfers?.length'}` : `args[1] === ${JSON.stringify(destination)}`
+  const matches = ['receipt', 'retiring'].includes(stage) ? `args[1].startsWith(paths.state + ${JSON.stringify(path.sep)}) && JSON.parse(await fs.readFile(args[1], 'utf8')).${stage === 'retiring' ? 'retiring' : 'taskTransfers?.length'}` : `args[1] === ${JSON.stringify(destination)}`
   const script = `
     import childProcess from 'node:child_process'
     import fs from 'node:fs/promises'
@@ -6686,7 +6820,7 @@ async function interruptTaskFamily(h, operation, stage) {
       } else await executeMove(from, to, paths, { processes: [] })
     }
   `
-  const result = await promisify(execFile)(process.execPath, ['--input-type=module', '-e', script], { cwd: here, env: { ...process.env, HOME: h.root } })
+  const result = await promisify(execFile)(process.execPath, ['--input-type=module', '-e', script], { cwd: here, env: { ...process.env, HOME: h.root, USERPROFILE: h.root } })
     .then(() => ({ code: 0 }), error => error)
   assert.equal(result.code, 23, result.stderr)
 }
@@ -7522,7 +7656,7 @@ test('restart diagnostics never rewrite a failed family receipt or journal and f
   const final = JSON.parse(await readFile(file))
   assert.equal(new Set(final.restartHistory.map(row => row.attemptId)).size, 3)
   assert.equal(final.restartHistory.length, 3)
-  assert.equal((await stat(log)).mode & 0o777, 0o600)
+  if (process.platform !== 'win32') assert.equal((await stat(log)).mode & 0o777, 0o600)
 })
 
 test('restart diagnostics preserve an unconfirmed quit after Desktop exits and reopens', async () => {
@@ -8455,7 +8589,7 @@ test('destination parents survive forks added after inventory or during final pr
   }
 })
 
-test('new or changed parent references during retirement roll back the journal', async () => {
+test('new or changed parent references during retirement roll back the journal', { skip: process.platform === 'win32' && 'needs a POSIX FIFO to pause a read' }, async () => {
   for (const change of ['new', 'changed']) for (const location of ['P', 'T']) {
     const h = await home(), richer = id(776), child = id(777), base = branchEntries(2, SOURCE, 1)
     await h.write(SOURCE, base)
@@ -9900,7 +10034,7 @@ extension Model {
 `
 }
 
-test('Swift section 1 wording states render the production panel and restart prompt', async t => {
+test('Swift section 1 wording states render the production panel and restart prompt', { skip: process.platform === 'win32' && 'the Swift menubar is macOS only' }, async t => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'ct-section1-panels-'))
   const fixtures = wordingFixtures(), file = path.join(root, 'wording.swift'), binary = path.join(root, 'wording')
   await writeFile(path.join(root, 'fixtures.json'), JSON.stringify(fixtures))
@@ -10046,7 +10180,7 @@ struct WordingChecks {
   for (const row of manifest) assert.deepEqual((await readFile(row.path)).subarray(0, 8), Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))
 })
 
-test('Swift preserves command, progress, metadata, and completion states', async () => {
+test('Swift preserves command, progress, metadata, and completion states', { skip: process.platform === 'win32' && 'the Swift menubar is macOS only' }, async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'ct-swift-state-'))
   const cliProgress = await cliProgressFixture()
   const checkpointAccounts = await checkpointAccountsFixture()
@@ -11217,7 +11351,7 @@ test('bounded near-order matching agrees with reference LCS and exact multiplici
 test('bounded near-order matching handles large histories without quadratic work or counter overflow', async t => {
   const { stdout } = await promisify(execFile)(process.execPath, ['--input-type=module', '-e', `
     import assert from 'node:assert/strict'
-    import { conversationMatch } from ${JSON.stringify(path.join(here, 'transplant.js'))}
+    import { conversationMatch } from ${JSON.stringify(pathToFileURL(path.join(here, 'transplant.js')).href)}
     const started = performance.now(), source = Array.from({ length: 100_000 }, (_, i) => i), target = [...source]
     for (let i = 0; i < 16; i += 2) [target[i], target[i + 1]] = [target[i + 1], target[i]]
     assert.equal(conversationMatch(source, target), 'equivalent')
@@ -11398,13 +11532,13 @@ test('incremental receipt journal replay stays within a small heap for a large s
     const original = fs.readFile
     fs.readFile = (file, ...args) => { assert.ok(!String(file).endsWith('.journal')); return original(file, ...args) }
     syncBuiltinESMExports()
-    const { readReceipt } = await import(${JSON.stringify(path.join(here, 'transplant.js'))})
+    const { readReceipt } = await import(${JSON.stringify(pathToFileURL(path.join(here, 'transplant.js')).href)})
     const receipt = await readReceipt(${JSON.stringify(file)})
     assert.equal(receipt.sessions.length, 256)
     assert.equal(receipt.journalSequence, 256)
     assert.equal(receipt.pending.padding.length, 512 * 1024)
     console.log(JSON.stringify({ records: receipt.sessions.length, heapUsed: process.memoryUsage().heapUsed }))
-  `], { timeout: 25_000, env: { ...process.env, HOME: root } })
+  `], { timeout: 25_000, env: { ...process.env, HOME: root, USERPROFILE: root } })
   const result = JSON.parse(stdout)
   assert.equal(result.records, 256)
   assert.ok(bytes > 128 * 1024 * 1024)
@@ -11421,7 +11555,7 @@ test('sidecar link leaves survive parent and child moves and Undo without readin
     await h.record('P', sid, rehomeRecord(sid === child ? { forkedFromSessionId: `local_${SOURCE}` } : {}))
     const dir = path.join(h.project, sid, 'workflow')
     await mkdir(dir, { recursive: true })
-    for (const [name, destination] of [['dangling', '../missing'], ['external', external], ['cycle', 'cycle'], ['regular-target', path.join(external, 'secret')]]) {
+    for (const [name, destination] of [['dangling', path.join('..', 'missing')], ['external', external], ['cycle', 'cycle'], ['regular-target', path.join(external, 'secret')]]) {
       const file = path.join(dir, name)
       await symlink(destination, file)
       links.push({ file, destination, inode: (await lstat(file)).ino })
@@ -11481,7 +11615,7 @@ test('sidecar link changes invalidate plans and link targets cannot masquerade a
   }
 })
 
-test('synthetic menubar installation reports the package version without invoking app actions', async () => {
+test('synthetic menubar installation reports the package version without invoking app actions', { skip: process.platform === 'win32' && 'the Swift menubar is macOS only' }, async () => {
   const h = await home()
   const setup = `
     import { writeFileSync } from 'node:fs'
@@ -11501,7 +11635,7 @@ test('synthetic menubar installation reports the package version without invokin
     const result = await cli(h.root, ['menubar'], setup)
     assert.equal(result.code, 0, result.stderr)
     const script = path.join(h.paths.state, 'Claude Transplant.app/Contents/Resources/transplant.js')
-    const { stdout } = await promisify(execFile)(process.execPath, [script, '--version'], { env: { ...process.env, HOME: h.root } })
+    const { stdout } = await promisify(execFile)(process.execPath, [script, '--version'], { env: { ...process.env, HOME: h.root, USERPROFILE: h.root } })
     assert.equal(stdout.trim(), JSON.parse(await readFile(path.join(here, 'package.json'))).version)
     assert.deepEqual(JSON.parse(await readFile(path.join(h.paths.state, 'menubar.json'))).nodeArgs, [`--max-old-space-size=${menubarHeapMiB()}`])
   }
@@ -11538,7 +11672,7 @@ test('sidecar link replacements are refused during regular reads and warm cache 
     fs.open = async (name, flags, ...args) => {
       assert.notEqual(name, physicalExternal)
       if (name === physicalFile && !warm && !replaced) {
-        assert.ok(flags & fsSync.constants.O_NOFOLLOW)
+        if (process.platform !== 'win32') assert.ok(flags & fsSync.constants.O_NOFOLLOW)
         await replace()
       }
       return originalOpen(name, flags, ...args)
