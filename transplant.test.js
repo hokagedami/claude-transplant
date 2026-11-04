@@ -11865,6 +11865,14 @@ test('with the Store build the tray lives beside Desktop data and a roaming tray
   assert.equal(removed.code, 0, removed.stderr)
   assert.equal(await stat(tray).catch(() => null), null)
   assert.equal(await stat(path.join(legacy, 'tray')).catch(() => null), null)
+  await fs.rm(legacy, { recursive: true, force: true })
+  await symlink(path.join(packaged, 'claude-transplant'), legacy, 'junction')
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const merged = await cli(h.root, ['menubar'], setup)
+    assert.equal(merged.code, 0, merged.stderr)
+    assert.equal(await readFile(path.join(tray, 'Claude Transplant.exe'), 'utf8'), 'synthetic tray')
+    assert.equal(await readFile(path.join(tray, 'transplant.js'), 'utf8'), await readFile(path.join(here, 'transplant.js'), 'utf8'))
+  }
 })
 
 test('the Windows tray compiles and describes accounts, sessions and waiting work', { skip: process.platform !== 'win32' }, async () => {

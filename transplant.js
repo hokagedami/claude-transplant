@@ -5227,7 +5227,12 @@ async function windowsTray(paths, remove, snapshot) {
   if (snapshot) throw new Error('menubar --snapshot renders the macOS panel only')
   const tray = path.join(paths.state, 'tray')
   const roamingTray = path.join(paths.home, 'AppData/Roaming/claude-transplant/tray')
-  const clearRoamingTray = () => roamingTray === tray ? null : rm(roamingTray, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
+  const clearRoamingTray = async () => {
+    const roamingTarget = await realpath(roamingTray).catch(() => null)
+    const trayTarget = await realpath(tray).catch(() => tray)
+    if (!roamingTarget || roamingTarget.toLowerCase() === trayTarget.toLowerCase() || roamingTarget.toLowerCase() === path.resolve(tray).toLowerCase()) return
+    await rm(roamingTray, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
+  }
   const binary = path.join(tray, 'Claude Transplant.exe')
   const shortcut = path.join(paths.home, 'AppData/Roaming/Microsoft/Windows/Start Menu/Programs/Startup/Claude Transplant.lnk')
   const stop = () => spawnSync(windowsSystem('System32', 'taskkill.exe'), ['/F', '/IM', 'Claude Transplant.exe'], { stdio: 'ignore', windowsHide: true })
