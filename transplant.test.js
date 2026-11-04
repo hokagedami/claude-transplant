@@ -11936,6 +11936,38 @@ test('the Windows tray compiles and describes accounts, sessions and waiting wor
   assert.equal(spawnSync(exe, ['--describe', sample], { encoding: 'utf8' }).stdout, 'No Claude Desktop accounts found')
 })
 
+test('the Windows tray progress window follows move events to a finished summary', { skip: process.platform !== 'win32' }, async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'transplant-tray-')), exe = path.join(dir, 'tray.exe'), events = path.join(dir, 'events.jsonl')
+  const build = spawnSync(path.win32.join(process.env.SystemRoot, 'Microsoft.NET', 'Framework64', 'v4.0.30319', 'csc.exe'),
+    ['-nologo', '-target:winexe', `-out:${exe}`, '-r:System.Web.Extensions.dll', '-r:System.Windows.Forms.dll', '-r:System.Drawing.dll', path.join(here, 'tray.cs')], { encoding: 'utf8' })
+  assert.equal(build.status, 0, build.stdout + build.stderr)
+  const live = (stage, completed, total) => ({ stage, text: `${completed}/${total}`, live: true, completed, total })
+  const left = (remainingCount) => ({ stage: 'sessions', text: 'Remaining sessions', live: true, sessionTotal: 4, remainingCount })
+  const replay = async (rows) => {
+    await writeFile(events, rows.map(row => JSON.stringify(row)).join('\n') + '\n')
+    const result = spawnSync(exe, ['--progress', events], { encoding: 'utf8' })
+    assert.equal(result.status, 0, result.stderr)
+    return result.stdout.split('\n').map(line => { const [percent, detail, step] = line.split(' | '); return { percent: Number(percent), detail, step } })
+  }
+  const moved = await replay([live('scan', 0, 4), live('scan', 4, 4), left(4), live('move', 2, 4), left(2), live('move', 4, 4), left(0), live('verify', 4, 4), live('retire', 4, 4), live('scan', 1, 4),
+    { done: true, ok: true, summary: { moved: 4 } }])
+  assert.equal(moved.length, 11)
+  assert.ok(moved.every((row, index) => index === 0 || row.percent >= moved[index - 1].percent), moved.map(row => row.percent).join(' '))
+  assert.ok(moved.slice(0, -1).every(row => row.percent < 100))
+  assert.ok(moved[4].percent > 0)
+  assert.equal(moved[4].detail, `${moved[4].percent}% · 2 sessions left`)
+  assert.equal(moved[3].step, 'Moving sessions 2/4')
+  assert.equal(moved[7].step, 'Verifying history 4/4')
+  assert.equal(moved[9].step, moved[8].step)
+  assert.deepEqual(moved.at(-1), { percent: 100, detail: '4 sessions moved', step: 'Done' })
+  const restarted = await replay([live('scan', 4, 4), { stage: 'desktop', text: 'Closing Claude Desktop', live: true }, live('move', 1, 1), { stage: 'reopen', text: 'Opening Claude Desktop', live: true },
+    { error: 'Claude Desktop did not reopen' }])
+  assert.equal(restarted[1].step, 'Closing Claude Desktop')
+  assert.equal(restarted[3].step, 'Opening Claude Desktop')
+  assert.ok(restarted[3].percent > restarted[1].percent)
+  assert.deepEqual(restarted.at(-1), { percent: restarted[3].percent, detail: 'Claude Desktop did not reopen', step: 'Stopped' })
+})
+
 test('regular sidecar hashes and fingerprints retain the existing receipt format', async () => {
   const h = await home(), data = Buffer.from('unchanged synthetic sidecar\n'), dir = path.join(h.project, SOURCE), file = path.join(dir, 'snapshot')
   await h.write(SOURCE, [entry('user', 1, null, SOURCE)])

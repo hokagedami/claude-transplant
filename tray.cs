@@ -17,6 +17,21 @@ static class Program {
             using (var output = Console.OpenStandardOutput()) output.Write(text, 0, text.Length);
             return 0;
         }
+        if (args.Length == 2 && args[0] == "--progress") {
+            var state = new ProgressState(0);
+            var shown = new List<string>();
+            foreach (var line in File.ReadAllLines(args[1])) {
+                var row = Json.Parse(line) as IDictionary<string, object>;
+                if (row == null) continue;
+                if (Json.Flag(row, "done")) state.Finish(ProgressState.Succeeded(row), ProgressState.Summary(row, null));
+                else if (Json.Text(row, "error") != null || Json.Text(row, "reason") != null) state.Finish(false, Json.Text(row, "error") ?? Json.Text(row, "reason"));
+                else state.Apply(row, 0);
+                shown.Add(state.Percent + " | " + state.Detail + " | " + state.Step);
+            }
+            var text = Encoding.UTF8.GetBytes(String.Join("\n", shown));
+            using (var output = Console.OpenStandardOutput()) output.Write(text, 0, text.Length);
+            return 0;
+        }
         bool created;
         using (var single = new Mutex(true, "ClaudeTransplantTray", out created)) {
             if (!created) return 0;
@@ -125,6 +140,11 @@ class Tray : ApplicationContext {
     IDictionary<string, object> plan;
     IDictionary<string, object> done;
     IDictionary<string, object> failure;
+    ProgressForm window;
+    ProgressState progress;
+    string progressTitle;
+    readonly Stopwatch clock = Stopwatch.StartNew();
+    readonly System.Windows.Forms.Timer ticker = new System.Windows.Forms.Timer { Interval = 250 };
 
     public Tray(Config config) {
         this.config = config;
@@ -135,8 +155,39 @@ class Tray : ApplicationContext {
         icon.Visible = true;
         icon.MouseUp += (sender, e) => { if (e.Button == MouseButtons.Left) ShowMenu(); };
         menu.Opening += (sender, e) => Build();
+        ticker.Tick += (sender, e) => {
+            if (progress == null) return;
+            progress.Refresh(clock.Elapsed.TotalSeconds);
+            ShowProgressState();
+        };
         Build();
         Refresh();
+    }
+
+    bool ProgressOpen { get { return window != null && !window.IsDisposed; } }
+
+    string ProgressHeading {
+        get {
+            if (progress == null || !progress.Finished) return progressTitle;
+            var operation = operationArgs != null ? operationArgs[0] : null;
+            var noun = operation == "undo" ? "Undo" : operation == "keep-local" ? "Keep local" : "Move";
+            return noun + (progress.Failed ? " stopped" : " finished");
+        }
+    }
+
+    void ShowProgressWindow() {
+        if (progress == null) return;
+        if (!ProgressOpen) window = new ProgressForm();
+        window.Render(ProgressHeading, progress);
+        if (!window.Visible) window.Show();
+        if (window.WindowState == FormWindowState.Minimized) window.WindowState = FormWindowState.Normal;
+        window.Activate();
+    }
+
+    void ShowProgressState() {
+        if (progress == null) return;
+        if (ProgressOpen) window.Render(ProgressHeading, progress);
+        if (!progress.Finished) Show(progressTitle + " · " + progress.Detail);
     }
 
     static Icon Glyph() {
@@ -174,6 +225,7 @@ class Tray : ApplicationContext {
         foreach (var line in Describe(accounts)) menu.Items.Add(new ToolStripMenuItem(line) { Enabled = false });
         menu.Items.Add(new ToolStripSeparator());
         var pending = accounts != null && accounts.Any(account => account.Pending != null);
+        if (progress != null && (running || ProgressOpen)) Add(running ? "Show progress" : "Show last result", true, ShowProgressWindow);
         Add("Move sessions…", !running && accounts != null && accounts.Count > 1, ChooseMove);
         Add("Finish", !running && pending, () => Start(new[] { "finish", "--json" }));
         Add("Keep local", !running && pending, () => Start(new[] { "keep-local", "--json" }));
@@ -230,7 +282,11 @@ class Tray : ApplicationContext {
         plan = null;
         done = null;
         failure = null;
-        Show(args[0] == "undo" ? "Undoing" : args[0] == "finish" ? "Finishing" : args[0] == "keep-local" ? "Keeping local" : "Moving");
+        progressTitle = args[0] == "undo" ? "Undoing the last move" : args[0] == "finish" ? "Finishing the move" : args[0] == "keep-local" ? "Keeping sessions local" : "Moving sessions";
+        progress = new ProgressState(clock.Elapsed.TotalSeconds);
+        Show(progressTitle);
+        ShowProgressWindow();
+        ticker.Start();
         Run(args, Handle, (code, output, error) => Finished(code, error));
     }
 
@@ -240,17 +296,17 @@ class Tray : ApplicationContext {
         if (Json.Flag(row, "plan")) plan = row;
         else if (Json.Flag(row, "done")) done = row;
         else if (Json.Text(row, "stage") != null && Json.Flag(row, "live")) {
-            var completed = Json.Number(row, "completed");
-            var total = Json.Number(row, "total");
-            var text = Json.Text(row, "text") ?? Json.Text(row, "stage");
-            Show(completed.HasValue && total.HasValue && total.Value > 0 ? text + " " + (100 * completed.Value / total.Value) + "%" : text);
+            if (progress != null) progress.Apply(row, clock.Elapsed.TotalSeconds);
+            ShowProgressState();
         }
         else if (Json.Text(row, "error") != null || Json.Text(row, "reason") != null) failure = row;
     }
 
     void Finished(int code, string error) {
         running = false;
+        ticker.Stop();
         if (plan != null && code == 0) {
+            if (ProgressOpen) window.Hide();
             if (approvalAttempted) {
                 Show("Ready");
                 Notify("Open Claude sessions changed before the restart. Try again.", true);
@@ -259,24 +315,26 @@ class Tray : ApplicationContext {
             Refresh();
             return;
         }
+        var problem = code != 0 || done != null && !ProgressState.Succeeded(done);
+        var outcome = Outcome(code, error);
+        if (progress != null) {
+            progress.Finish(!problem, outcome);
+            if (ProgressOpen && window.Visible) window.Render(ProgressHeading, progress);
+            else ShowProgressWindow();
+        }
         Show("Ready");
-        Notify(Outcome(code, error), code != 0 || done != null && done.ContainsKey("ok") && !Json.Flag(done, "ok"));
+        Notify(outcome, problem);
         Refresh();
     }
 
     string Outcome(int code, string error) {
-        var note = Json.Text(done, "note") ?? Json.Text(done, "reason");
-        if (note != null) return note;
-        if (code != 0) {
+        if (code != 0 && Json.Text(done, "note") == null && Json.Text(done, "reason") == null) {
             var detail = Json.Text(failure, "error") ?? Json.Text(failure, "reason");
             if (detail != null) return detail;
             var lines = (error ?? "").Split('\n').Select(text => text.Trim()).Where(text => text.Length > 0 && !text.Contains("ExperimentalWarning") && !text.Contains("--trace-warnings")).ToArray();
             return lines.Length > 0 ? lines.Last() : "The operation failed";
         }
-        if (Json.Flag(done, "nothing")) return "Nothing to move";
-        var moved = Json.Number(Json.Row(done, "summary"), "moved") ?? Json.Number(done, "moved");
-        if (moved.HasValue) return moved.Value + (moved.Value == 1 ? " session moved" : " sessions moved");
-        return operationArgs != null && operationArgs[0] == "undo" ? "Undo finished" : "Finished";
+        return ProgressState.Summary(done, operationArgs != null ? operationArgs[0] : null);
     }
 
     void Confirm(IDictionary<string, object> restart) {
@@ -350,6 +408,190 @@ class Tray : ApplicationContext {
         quoted.Append('\\', slashes * 2);
         quoted.Append('"');
         return quoted.ToString();
+    }
+}
+
+class MoveProgress {
+    static readonly string[] Phases = { "prepare", "cloudScan", "close", "rescan", "move", "verify", "retire", "finalize", "reopen", "cloud" };
+    static readonly Dictionary<string, double> Costs = new Dictionary<string, double> {
+        { "prepare", 0.004 }, { "cloudScan", 1 }, { "close", 2 }, { "rescan", 0.001 }, { "move", 0.0015 }, { "verify", 0.0003 }, { "retire", 0.0002 }, { "finalize", 0.0015 }, { "reopen", 1 }, { "cloud", 1 }
+    };
+    static readonly HashSet<string> Scaled = new HashSet<string> { "prepare", "rescan", "move", "verify", "retire", "finalize" };
+    readonly HashSet<string> skipped = new HashSet<string>();
+    string phase = "prepare";
+    double started;
+    int sessions;
+    bool hasProgress;
+    int? completed;
+    int? total;
+    double value;
+    bool restarting;
+    int? remainingSessions;
+
+    public MoveProgress(double now) { started = now; }
+
+    public int Percent { get { return Math.Min(99, (int)(value * 100)); } }
+
+    public string Detail {
+        get {
+            if (!remainingSessions.HasValue || remainingSessions.Value == 0) return Percent + "%";
+            return Percent + "% · " + remainingSessions.Value + (remainingSessions.Value == 1 ? " session" : " sessions") + " left";
+        }
+    }
+
+    double Units(string key) { return Scaled.Contains(key) ? Math.Max(1, sessions) : 1; }
+
+    double Duration(string key) {
+        double cost;
+        return skipped.Contains(key) ? 0 : (Costs.TryGetValue(key, out cost) ? cost : 1) * Units(key);
+    }
+
+    public void Sessions(int sessionTotal, int remaining) { remainingSessions = Math.Min(sessionTotal, Math.Max(0, remaining)); }
+
+    public bool Update(string stage, int? count, int? size, bool preparatory, double now) {
+        if (stage == "desktop" && !preparatory) restarting = true;
+        string mapped;
+        switch (stage) {
+            case "scan": mapped = restarting ? "rescan" : "prepare"; break;
+            case "cloud scan": mapped = restarting || Array.IndexOf(Phases, phase) >= 4 ? "cloud" : "cloudScan"; break;
+            case "desktop": mapped = "close"; break;
+            case "reopen": mapped = "reopen"; break;
+            case "move": mapped = "move"; break;
+            case "verify": case "retire": case "finalize": mapped = stage; break;
+            case "cloud": mapped = "cloud"; break;
+            default: return false;
+        }
+        var next = preparatory ? "cloudScan" : mapped;
+        int index = Array.IndexOf(Phases, next), previous = Array.IndexOf(Phases, phase);
+        if (index < previous) return false;
+        if (next == "move" && !restarting) { skipped.Add("close"); skipped.Add("rescan"); skipped.Add("reopen"); }
+        if (size == 0) {
+            if (index > previous || !hasProgress) skipped.Add(next);
+            Refresh(now);
+            return true;
+        }
+        skipped.Remove(next);
+        if (next != phase) {
+            if (!hasProgress) skipped.Add(phase);
+            for (var missing = previous + 1; missing < index; missing++) skipped.Add(Phases[missing]);
+            phase = next;
+            started = now;
+        }
+        hasProgress = true;
+        if (Scaled.Contains(next) && size.HasValue) sessions = Math.Max(sessions, size.Value);
+        completed = count;
+        total = size;
+        Refresh(now);
+        return true;
+    }
+
+    public void Refresh(double now) {
+        var elapsed = Math.Max(0, now - started);
+        var fraction = completed.HasValue && total.HasValue && total.Value > 0
+            ? Math.Min(1, (double)completed.Value / total.Value)
+            : Math.Min(0.95, elapsed / Math.Max(0.1, elapsed + Duration(phase)));
+        var index = Array.IndexOf(Phases, phase);
+        var before = Phases.Take(index).Sum(key => Duration(key));
+        var remaining = Phases.Sum(key => Duration(key));
+        value = Math.Max(value, Math.Min(0.99, (before + Duration(phase) * fraction) / Math.Max(0.1, remaining)));
+    }
+}
+
+class ProgressState {
+    static readonly Dictionary<string, string> StepNames = new Dictionary<string, string> {
+        { "scan", "Checking sessions" }, { "cloud scan", "Checking Remote Control copies" }, { "move", "Moving sessions" }, { "verify", "Verifying history" },
+        { "retire", "Retiring old records" }, { "finalize", "Finishing up" }, { "cloud", "Cleaning up Remote Control copies" }
+    };
+    readonly MoveProgress progress;
+    public string Step = "Starting";
+    public string Outcome;
+    public bool Finished;
+    public bool Failed;
+
+    public ProgressState(double now) { progress = new MoveProgress(now); }
+
+    public int Percent { get { return Finished && !Failed ? 100 : progress.Percent; } }
+    public string Detail { get { return Outcome ?? progress.Detail; } }
+
+    public void Refresh(double now) { if (!Finished) progress.Refresh(now); }
+
+    public void Apply(IDictionary<string, object> row, double now) {
+        var stage = Json.Text(row, "stage");
+        if (stage == null || !Json.Flag(row, "live") || Finished) return;
+        if (stage == "sessions") {
+            var sessionTotal = Json.Number(row, "sessionTotal");
+            var remaining = Json.Number(row, "remainingCount");
+            if (sessionTotal.HasValue && remaining.HasValue) progress.Sessions(sessionTotal.Value, remaining.Value);
+            return;
+        }
+        var completed = Json.Number(row, "completed");
+        var total = Json.Number(row, "total");
+        var accepted = progress.Update(stage, completed, total, Json.Flag(row, "preparatory"), now);
+        string name;
+        if (!StepNames.TryGetValue(stage, out name)) name = Json.Text(row, "text");
+        if (name == null || !accepted && stage != "rollback" && stage != "recovery") return;
+        Step = completed.HasValue && total.HasValue && total.Value > 0 ? name + " " + completed.Value + "/" + total.Value : name;
+    }
+
+    public void Finish(bool ok, string outcome) {
+        Finished = true;
+        Failed = !ok;
+        Outcome = outcome;
+        Step = ok ? "Done" : "Stopped";
+    }
+
+    public static bool Succeeded(IDictionary<string, object> done) {
+        return done != null && (!done.ContainsKey("ok") || Json.Flag(done, "ok"));
+    }
+
+    public static string Summary(IDictionary<string, object> done, string operation) {
+        var note = Json.Text(done, "note") ?? Json.Text(done, "reason");
+        if (note != null) return note;
+        if (Json.Flag(done, "nothing")) return "Nothing to move";
+        var moved = Json.Number(Json.Row(done, "summary"), "moved") ?? Json.Number(done, "moved");
+        if (moved.HasValue) return moved.Value + (moved.Value == 1 ? " session moved" : " sessions moved");
+        return operation == "undo" ? "Undo finished" : "Finished";
+    }
+}
+
+class ProgressForm : Form {
+    readonly Label heading = new Label { AutoSize = true, Padding = new Padding(0, 0, 0, 8) };
+    readonly ProgressBar bar = new ProgressBar { Minimum = 0, Maximum = 100, Style = ProgressBarStyle.Continuous, Width = 380, Height = 18 };
+    readonly Label detail = new Label { AutoSize = true, Padding = new Padding(0, 8, 0, 0) };
+    readonly Label step = new Label { AutoSize = true, ForeColor = SystemColors.GrayText, Padding = new Padding(0, 2, 0, 0) };
+    readonly Button action = new Button { Text = "Hide", AutoSize = true };
+    bool finished;
+
+    public ProgressForm() {
+        Text = "Claude Transplant";
+        FormBorderStyle = FormBorderStyle.FixedDialog;
+        MaximizeBox = false;
+        MinimizeBox = true;
+        StartPosition = FormStartPosition.CenterScreen;
+        AutoSize = true;
+        AutoSizeMode = AutoSizeMode.GrowAndShrink;
+        Padding = new Padding(16);
+        heading.Font = new Font(Font.FontFamily, 10.5f, FontStyle.Bold);
+        var layout = new FlowLayoutPanel { FlowDirection = FlowDirection.TopDown, AutoSize = true, WrapContents = false };
+        layout.Controls.Add(heading);
+        layout.Controls.Add(bar);
+        layout.Controls.Add(detail);
+        layout.Controls.Add(step);
+        var buttons = new FlowLayoutPanel { FlowDirection = FlowDirection.RightToLeft, Width = 380, Height = 36, Padding = new Padding(0, 8, 0, 0) };
+        buttons.Controls.Add(action);
+        layout.Controls.Add(buttons);
+        Controls.Add(layout);
+        action.Click += (sender, e) => { if (finished) Close(); else Hide(); };
+        FormClosing += (sender, e) => { if (!finished && e.CloseReason == CloseReason.UserClosing) { e.Cancel = true; Hide(); } };
+    }
+
+    public void Render(string title, ProgressState state) {
+        finished = state.Finished;
+        heading.Text = title;
+        bar.Value = Math.Max(0, Math.Min(100, state.Percent));
+        detail.Text = state.Detail;
+        step.Text = state.Step;
+        action.Text = state.Finished ? "Close" : "Hide";
     }
 }
 
