@@ -23,7 +23,13 @@ npx claude-transplant menubar
 
 On macOS, open the panel from the menu bar, check the accounts to take from, pick the one to land in, click Move. Sign Claude Desktop into that account and the sessions are listed there.
 
-On Windows, run the same command in PowerShell or Command Prompt. It installs a tray icon next to the clock, which may sit under the ^ overflow arrow. Click it, choose Move sessions…, pick the account to land in and the accounts to take from, then sign Claude Desktop into that account. See [Windows tray](#windows-tray).
+On Windows, the npm package is still the macOS-only release, so install from GitHub instead:
+
+```
+npx github:hokagedami/claude-transplant menubar
+```
+
+It installs a tray icon next to the clock, which may sit under the ^ overflow arrow. Click it, choose Move sessions…, pick the account to land in and the accounts to take from, then sign Claude Desktop into that account. The full walkthrough is in [Install on Windows](#install-on-windows).
 
 ## What it does
 
@@ -48,12 +54,53 @@ Where it fits next to the other tools people find for this problem:
 Node 22 or newer, 22.13 or newer for `--cloud` on Windows. On macOS the menubar also needs the Xcode command line tools: `xcode-select --install`. On Windows nothing else is needed: the tray is built with the .NET Framework 4 compiler that ships with Windows 10 and 11, and Claude Desktop from the Microsoft Store or its installer both work.
 
 ```
-npx claude-transplant menubar   # install the menubar app, or the tray on Windows
+npx claude-transplant menubar   # install the menubar app on macOS, Windows is below
 npx claude-transplant           # CLI
 npm i -g claude-transplant      # global install, then claude-transplant
 ```
 
 From this repo instead of npm: `npx github:vitaliyhayda/claude-transplant` (append a tag or commit hash to pin).
+
+### Install on Windows
+
+The Windows port is not on npm yet. `npx claude-transplant` on Windows stops with `Unsupported platform for claude-transplant@4.2.1: wanted {"os":"darwin"}`, so every command below runs from GitHub. Nothing needs administrator rights.
+
+1. **Claude Desktop.** Install it from the Microsoft Store or claude.ai/download, and sign in at least once with each account you want to move between.
+2. **Node.js 22.13 or newer.** Install the LTS from [nodejs.org](https://nodejs.org) or with `winget install OpenJS.NodeJS.LTS`, then open a new PowerShell window and check:
+
+   ```
+   node --version
+   ```
+
+3. **Install the tray.** In PowerShell or Command Prompt:
+
+   ```
+   npx github:hokagedami/claude-transplant menubar
+   ```
+
+   Answer `y` when npx asks to install the package. The command builds `Claude Transplant.exe` with the .NET compiler built into Windows, adds it to Startup and starts it.
+4. **Find the icon.** It is a blue circle with two arrows next to the clock. If you don't see it, click the ^ arrow. To keep it visible, drag it onto the taskbar, or turn it on in Settings › Personalization › Taskbar › Other system tray icons.
+5. **Move sessions.** Click the icon, choose Move sessions…, pick the account to move to and the accounts to take from, then Move. If chats are open, it asks before restarting Claude Desktop. When it finishes, sign Desktop into the destination account and the sessions are in the Code sidebar.
+
+Prefer the terminal? `npx github:hokagedami/claude-transplant` opens the same picker in the console, and `npx github:hokagedami/claude-transplant accounts` lists accounts without changing anything.
+
+**Update:** run the install command from step 3 again. The tray stops, rebuilds if needed and starts again.
+
+**Uninstall:**
+
+```
+npx github:hokagedami/claude-transplant menubar --remove
+```
+
+This removes the tray and its Startup shortcut. Receipts and quarantine stay in `%APPDATA%\claude-transplant`. Delete that folder only when you no longer need `undo`.
+
+**If something goes wrong:**
+
+- `Unsupported platform ... wanted {"os":"darwin"}`: you ran the npm package. Use the `github:hokagedami/claude-transplant` commands above.
+- `running scripts is disabled on this system`: PowerShell is blocking `npx.ps1`. Run the same command in Command Prompt, or type `npx.cmd` instead of `npx`.
+- No icon after installing: check the ^ overflow first, then look for Claude Transplant in Task Manager. Running the install command again restarts it.
+- The tray stops responding after Node is upgraded or moved: it remembers the `node.exe` it was installed with, so run the install command again.
+- Cloud cleanup fails with an error about `node:sqlite`: Node is older than 22.13. Upgrade Node, then run the install command again.
 
 ## Menubar
 
@@ -69,7 +116,7 @@ From this repo instead of npm: `npx github:vitaliyhayda/claude-transplant` (appe
 
 The Windows counterpart of the menubar, a small tray app with the same moves.
 
-- `npx claude-transplant menubar` builds a tray app with `csc.exe`, adds a Startup shortcut and starts it. `menubar --remove` stops it and removes both.
+- `npx github:hokagedami/claude-transplant menubar` builds a tray app with `csc.exe`, adds a Startup shortcut and starts it. `menubar --remove` stops it and removes both.
 - The menu lists each account with its session count, the signed-in account, and work that is waiting. Move sessions… picks the destination and the accounts to take from, then moves with `--cloud`.
 - A move that needs Desktop closed asks first and names the open chats that will stop: Restart and move, Move the others only, or Cancel.
 - Finish, Keep local and Undo last move run the same CLI commands. Progress shows in the icon's tooltip and the result as a notification.
@@ -154,7 +201,7 @@ Team owners get usage analytics only. Enterprise compliance tooling can retrieve
 
 ### Does it work on Windows or Linux?
 
-Windows, yes: the CLI, `--cloud` and a tray app. Desktop keeps its login cookies locked while it runs, so on Windows cloud cleanup happens only during a move that restarts Desktop, and other moves leave it waiting. Linux is not supported.
+Windows, yes: the CLI, `--cloud` and a tray app, installed as in [Install on Windows](#install-on-windows). Desktop keeps its login cookies locked while it runs, so on Windows cloud cleanup happens only during a move that restarts Desktop, and other moves leave it waiting. Linux is not supported.
 
 Shorter answers:
 
