@@ -11780,7 +11780,16 @@ test('Windows tray installation builds once, starts at sign-in and removes clean
   assert.deepEqual(calls.map(call => call.name), ['csc', 'taskkill', 'shortcut', 'start', 'taskkill', 'shortcut', 'start'])
   assert.equal(await readFile(path.join(tray, 'Claude Transplant.exe'), 'utf8'), 'synthetic tray')
   assert.ok(calls.filter(call => call.name === 'shortcut').every(call => call.detail.includes(path.join(tray, 'Claude Transplant.exe'))))
-  const removed = await cli(h.root, ['menubar', '--remove'], setup)
+  const exiting = async (action) => {
+    const running = await hold(path.join(tray, 'Claude Transplant.exe'))
+    const release = setTimeout(() => running.stdin.end(), 1500)
+    try { return await action() } finally { clearTimeout(release); running.stdin.end() }
+  }
+  await writeFile(path.join(tray, 'build.sha256'), 'an older build')
+  const rebuilt = await exiting(() => cli(h.root, ['menubar'], setup))
+  assert.equal(rebuilt.code, 0, rebuilt.stderr)
+  assert.equal(await stat(`${tray}.building`).catch(() => null), null)
+  const removed = await exiting(() => cli(h.root, ['menubar', '--remove'], setup))
   assert.equal(removed.code, 0, removed.stderr)
   assert.match(removed.stdout, /tray removed/)
   assert.equal(await stat(tray).catch(() => null), null)
