@@ -17,6 +17,18 @@ static class Program {
             using (var output = Console.OpenStandardOutput()) output.Write(text, 0, text.Length);
             return 0;
         }
+        if (args.Length == 2 && args[0] == "--move-plan") {
+            var listed = Account.Parse(File.ReadAllText(args[1])) ?? new List<Account>();
+            var destination = MovePlan.DefaultDestination(listed);
+            var sources = MovePlan.DefaultSources(listed, destination);
+            var shown = new List<string> { "to: " + (destination >= 0 ? listed[destination].Label : "none") };
+            shown.AddRange(sources.Select(index => "from: " + listed[index].Label));
+            shown.Add(MovePlan.Summary(listed, destination, sources));
+            shown.Add("button: " + MovePlan.ButtonText(listed, destination, sources));
+            var text = Encoding.UTF8.GetBytes(String.Join("\n", shown));
+            using (var output = Console.OpenStandardOutput()) output.Write(text, 0, text.Length);
+            return 0;
+        }
         if (args.Length == 2 && args[0] == "--progress") {
             var state = new ProgressState(0);
             var shown = new List<string>();
@@ -64,6 +76,15 @@ static class Json {
         if (value is double) return (int)(double)value;
         return null;
     }
+    public static double? Real(IDictionary<string, object> row, string key) {
+        object value;
+        if (row == null || !row.TryGetValue(key, out value) || value == null) return null;
+        if (value is int) return (int)value;
+        if (value is long) return (long)value;
+        if (value is decimal) return (double)(decimal)value;
+        if (value is double) return (double)value;
+        return null;
+    }
     public static IDictionary<string, object> Row(IDictionary<string, object> row, string key) {
         object value;
         return row != null && row.TryGetValue(key, out value) ? value as IDictionary<string, object> : null;
@@ -94,6 +115,7 @@ class Account {
     public int? Sessions;
     public bool Active;
     public bool SignedIn;
+    public double? ActiveAt;
     public string Pending;
     public string PendingAction;
     public static List<Account> Parse(string text) {
@@ -105,6 +127,7 @@ class Account {
             Sessions = Json.Number(row, "sessions"),
             Active = Json.Flag(row, "active"),
             SignedIn = Json.Flag(row, "signedIn"),
+            ActiveAt = Json.Real(row, "activeAt"),
             Pending = Json.Text(row, "pending"),
             PendingAction = Json.Text(row, "pendingAction")
         }).ToList();
@@ -595,13 +618,46 @@ class ProgressForm : Form {
     }
 }
 
+static class MovePlan {
+    public static int DefaultDestination(List<Account> accounts) {
+        var active = accounts.FindIndex(account => account.Active);
+        if (active < 0) return -1;
+        return Enumerable.Range(0, accounts.Count).Where(index => index != active)
+            .OrderByDescending(index => accounts[index].ActiveAt ?? 0).DefaultIfEmpty(-1).First();
+    }
+
+    public static List<int> DefaultSources(List<Account> accounts, int destination) {
+        if (destination < 0) return new List<int>();
+        return Enumerable.Range(0, accounts.Count).Where(index => index != destination && (accounts[index].Sessions ?? 0) > 0).ToList();
+    }
+
+    static int Count(List<Account> accounts, IEnumerable<int> sources) { return sources.Sum(index => accounts[index].Sessions ?? 0); }
+
+    static string Sessions(int count) { return count + (count == 1 ? " session" : " sessions"); }
+
+    public static string Summary(List<Account> accounts, int destination, List<int> sources) {
+        if (destination < 0) return "Choose the account to move sessions to";
+        if (sources.Count == 0) return "Check the accounts to move sessions from";
+        var origin = sources.Count == 1 ? accounts[sources[0]].Label : sources.Count + " accounts";
+        return "Moves " + Sessions(Count(accounts, sources)) + " from " + origin + " to " + accounts[destination].Label;
+    }
+
+    public static string ButtonText(List<Account> accounts, int destination, List<int> sources) {
+        return destination < 0 || sources.Count == 0 ? "Move" : "Move " + Sessions(Count(accounts, sources));
+    }
+}
+
 class MoveForm : Form {
     readonly List<Account> accounts;
     readonly CheckedListBox sources = new CheckedListBox { CheckOnClick = true, Dock = DockStyle.Fill, IntegralHeight = false };
     readonly ComboBox destination = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Dock = DockStyle.Fill };
+    readonly Label summary = new Label { AutoSize = true, MaximumSize = new Size(436, 0), Padding = new Padding(0, 10, 0, 4) };
     readonly Button move = new Button { Text = "Move", DialogResult = DialogResult.OK, AutoSize = true };
-    public IEnumerable<Account> Sources { get { return sources.CheckedIndices.Cast<int>().Select(index => Others()[index]); } }
-    public Account Destination { get { return accounts[destination.SelectedIndex]; } }
+    List<int> listed = new List<int>();
+    int chosen = -1;
+
+    public IEnumerable<Account> Sources { get { return Checked().Select(index => accounts[index]); } }
+    public Account Destination { get { return accounts[chosen]; } }
 
     public MoveForm(List<Account> accounts) {
         this.accounts = accounts;
@@ -610,18 +666,20 @@ class MoveForm : Form {
         MaximizeBox = false;
         MinimizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
-        ClientSize = new Size(460, 300);
+        ClientSize = new Size(460, 340);
         var cancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel, AutoSize = true };
-        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(12), ColumnCount = 1, RowCount = 5 };
-        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(12), ColumnCount = 1, RowCount = 6 };
         layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        layout.Controls.Add(new Label { Text = "Move to", AutoSize = true });
-        layout.Controls.Add(destination);
-        layout.Controls.Add(new Label { Text = "Move sessions from", AutoSize = true, Padding = new Padding(0, 8, 0, 0) });
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        layout.Controls.Add(new Label { Text = "1. Move sessions from", AutoSize = true });
         layout.Controls.Add(sources);
+        layout.Controls.Add(new Label { Text = "2. Move them to", AutoSize = true, Padding = new Padding(0, 8, 0, 0) });
+        layout.Controls.Add(destination);
+        layout.Controls.Add(summary);
         var buttons = new FlowLayoutPanel { FlowDirection = FlowDirection.RightToLeft, Dock = DockStyle.Fill, AutoSize = true };
         buttons.Controls.Add(cancel);
         buttons.Controls.Add(move);
@@ -630,24 +688,31 @@ class MoveForm : Form {
         AcceptButton = move;
         CancelButton = cancel;
         foreach (var account in accounts) destination.Items.Add(account.Summary);
-        destination.SelectedIndexChanged += (sender, e) => Fill();
-        sources.ItemCheck += (sender, e) => BeginInvoke(new Action(Enable));
-        var active = accounts.FindIndex(account => account.Active);
-        destination.SelectedIndex = active >= 0 ? active : 0;
+        chosen = MovePlan.DefaultDestination(accounts);
+        destination.SelectedIndex = chosen;
+        Fill(MovePlan.DefaultSources(accounts, chosen));
+        destination.SelectedIndexChanged += (sender, e) => {
+            var keep = Checked();
+            chosen = destination.SelectedIndex;
+            Fill(keep.Count > 0 ? keep : MovePlan.DefaultSources(accounts, chosen));
+        };
+        sources.ItemCheck += (sender, e) => BeginInvoke(new Action(Describe));
     }
 
-    List<Account> Others() {
-        return accounts.Where((account, index) => index != destination.SelectedIndex).ToList();
-    }
+    List<int> Checked() { return sources.CheckedIndices.Cast<int>().Select(index => listed[index]).Where(index => index != chosen).ToList(); }
 
-    void Fill() {
+    void Fill(List<int> check) {
+        listed = Enumerable.Range(0, accounts.Count).Where(index => index != chosen).ToList();
         sources.Items.Clear();
-        foreach (var account in Others()) sources.Items.Add(account.Summary);
-        Enable();
+        foreach (var index in listed) sources.Items.Add(accounts[index].Summary, check.Contains(index));
+        Describe();
     }
 
-    void Enable() {
-        move.Enabled = sources.CheckedItems.Count > 0;
+    void Describe() {
+        var picked = Checked();
+        summary.Text = MovePlan.Summary(accounts, chosen, picked);
+        move.Text = MovePlan.ButtonText(accounts, chosen, picked);
+        move.Enabled = chosen >= 0 && picked.Count > 0;
     }
 }
 

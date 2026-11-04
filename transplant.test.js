@@ -11936,6 +11936,27 @@ test('the Windows tray compiles and describes accounts, sessions and waiting wor
   assert.equal(spawnSync(exe, ['--describe', sample], { encoding: 'utf8' }).stdout, 'No Claude Desktop accounts found')
 })
 
+test('the Windows tray move window starts from the signed-in account toward the most recent other one', { skip: process.platform !== 'win32' }, async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'transplant-tray-')), exe = path.join(dir, 'tray.exe'), sample = path.join(dir, 'accounts.json')
+  const build = spawnSync(path.win32.join(process.env.SystemRoot, 'Microsoft.NET', 'Framework64', 'v4.0.30319', 'csc.exe'),
+    ['-nologo', '-target:winexe', `-out:${exe}`, '-r:System.Web.Extensions.dll', '-r:System.Windows.Forms.dll', '-r:System.Drawing.dll', path.join(here, 'tray.cs')], { encoding: 'utf8' })
+  assert.equal(build.status, 0, build.stdout + build.stderr)
+  const now = Date.now()
+  const plan = async (rows) => {
+    await writeFile(sample, JSON.stringify(rows))
+    const result = spawnSync(exe, ['--move-plan', sample], { encoding: 'utf8' })
+    assert.equal(result.status, 0, result.stderr)
+    return result.stdout.split('\n')
+  }
+  const company = { account: 'c', org: 'o', label: 'm@company.example · Company', sessions: 100, active: true, signedIn: true, activeAt: now - 2 * 3600000 }
+  const personal = { account: 'p', org: 'q', label: 'm@home.example · Personal', sessions: 6, activeAt: now - 30 * 86400000 }
+  assert.deepEqual(await plan([personal, company]), ['to: m@home.example · Personal', 'from: m@company.example · Company', 'Moves 100 sessions from m@company.example · Company to m@home.example · Personal', 'button: Move 100 sessions'])
+  const newer = { account: 'n', org: 'r', label: 'n@example.com · Newer', sessions: 1, activeAt: now - 60000 }
+  const empty = { account: 'e', org: 's', label: 'e@example.com · Empty', sessions: 0, activeAt: null }
+  assert.deepEqual(await plan([company, personal, newer, empty]), ['to: n@example.com · Newer', 'from: m@company.example · Company', 'from: m@home.example · Personal', 'Moves 106 sessions from 2 accounts to n@example.com · Newer', 'button: Move 106 sessions'])
+  assert.deepEqual(await plan([{ ...company, active: false }, personal]), ['to: none', 'Choose the account to move sessions to', 'button: Move'])
+})
+
 test('the Windows tray progress window follows move events to a finished summary', { skip: process.platform !== 'win32' }, async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'transplant-tray-')), exe = path.join(dir, 'tray.exe'), events = path.join(dir, 'events.jsonl')
   const build = spawnSync(path.win32.join(process.env.SystemRoot, 'Microsoft.NET', 'Framework64', 'v4.0.30319', 'csc.exe'),
