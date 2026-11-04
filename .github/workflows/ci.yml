@@ -17,9 +17,19 @@ jobs:
       - run: npm test
       - run: swiftc -parse-as-library -typecheck menubar.swift
       - run: npm pack && npm i -g ./claude-transplant-*.tgz && claude-transplant --version && claude-transplant --help
+  test-windows:
+    runs-on: windows-latest
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - run: npm test
+      - run: '& "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\csc.exe" -nologo -target:winexe -out:tray.exe -r:System.Web.Extensions.dll -r:System.Windows.Forms.dll -r:System.Drawing.dll tray.cs; if ($LASTEXITCODE) { exit $LASTEXITCODE }'
+      - run: npm pack; npm i -g (Get-Item claude-transplant-*.tgz).FullName; claude-transplant --version; claude-transplant --help
   publish:
     if: github.event_name == 'release' && !github.event.release.prerelease
-    needs: test
+    needs: [test, test-windows]
     runs-on: ubuntu-latest
     permissions:
       contents: read

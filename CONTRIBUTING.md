@@ -15,3 +15,5 @@ The October 11, 2026 disposable API test ran on a Mac with Claude Desktop 2.3122
 When process inspection is denied, focused fixtures can preload an empty `/bin/ps` result and a not-running `/usr/bin/pgrep` result. Tests that enumerate real processes need `ps` access.
 
 Run `swiftc -typecheck -parse-as-library menubar.swift`. The `@main` app needs library parsing.
+
+On Windows, tests set `USERPROFILE` beside `HOME`, because Node reads the home folder from `USERPROFILE` there, and the Windows process query returns an empty table unless a test supplies one. The tray compiles with `%WINDIR%Microsoft.NETFramework644.0.30319csc.exe -target:winexe -r:System.Web.Extensions.dll -r:System.Windows.Forms.dll -r:System.Drawing.dll tray.cs`, which accepts C# 5 only. `tray.exe --describe <accounts.json>` prints its menu lines without starting the tray.

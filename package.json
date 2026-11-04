@@ -8,7 +8,8 @@
   },
   "files": [
     "transplant.js",
-    "menubar.swift"
+    "menubar.swift",
+    "tray.cs"
   ],
   "engines": {
     "node": ">=22"
@@ -42,7 +43,8 @@
   ],
   "license": "MIT",
   "os": [
-    "darwin"
+    "darwin",
+    "win32"
   ],
   "author": "Vitaliy Hayda (https://github.com/vitaliyhayda)"
 }

@@ -25,7 +25,8 @@ const SCHEDULER_OWNS = 'Desktop scheduler requires an approved restart'
 const TASK_STATE_KEYS = ['recordedSkips', 'runRetries']
 const PARENT_MISSING = 'parent Desktop record is absent from the target and move'
 const TASK_FAMILY_BLOCKED = 'scheduled task family blocked by'
-const desktopExecutable = (file) => typeof file === 'string' && file.endsWith('/Claude.app/Contents/MacOS/Claude')
+const windowsDesktop = /\\(WindowsApps\\Claude_[^\\]+\\app|AnthropicClaude\\app-[^\\]+)\\claude\.exe$/i
+const desktopExecutable = (file) => typeof file === 'string' && (file.endsWith('/Claude.app/Contents/MacOS/Claude') || windowsDesktop.test(file))
 const SHUTDOWN_WAIT = 30_000
 const REOPEN_RESERVE = 8_000
 const STALL_WAIT = 60_000
@@ -271,10 +272,47 @@ export function parseProcesses(processes, commands, app = '/Applications/Claude.
   return rows
 }
 
+const fileTimeMilliseconds = (ticks) => /^\d+$/.test(String(ticks ?? '')) ? Number(BigInt(ticks) / 10000n) - 11644473600000 : NaN
+
+export function parseWindowsProcesses(json, registrations = [], host = os.hostname()) {
+  let listed
+  try { listed = json.trim() ? JSON.parse(json) : [] } catch { throw new Error('cannot parse worker process identity') }
+  const domain = `win32:${host.toLowerCase()}`
+  const rows = [listed].flat().map((item) => {
+    const created = fileTimeMilliseconds(item.Created)
+    const type = String(item.CommandLine ?? '').match(/\s--type=(\S+)/)?.[1]
+    const executable = item.ExecutablePath ? (type ? `${item.ExecutablePath} --type=${type}` : item.ExecutablePath) : ''
+    const row = { pid: Number(item.ProcessId), ppid: Number(item.ParentProcessId), started: Number.isFinite(created) ? new Date(created).toISOString() : '', executable,
+      worker: !type && /^claude(\.exe)?$/i.test(path.win32.basename(executable)), ids: (String(item.CommandLine ?? '').match(UUIDS) ?? []).map((id) => id.toLowerCase()) }
+    const registered = row.worker && Number.isFinite(created) && registrations.find(entry => entry.pid === row.pid && String(entry.pidDomain).toLowerCase() === domain &&
+      fileTimeMilliseconds(entry.procStart) === created && UUID.test(entry.sessionId ?? ''))
+    if (registered) Object.assign(row, { ids: [...new Set([...row.ids, registered.sessionId.toLowerCase()])],
+      cwd: typeof registered.cwd === 'string' ? registered.cwd : null, sessionName: typeof registered.name === 'string' ? registered.name : null })
+    return row
+  })
+  const byPid = new Map(rows.map((row) => [row.pid, row]))
+  for (const row of rows) {
+    const visited = new Set()
+    let parent = row
+    row.desktopPid = null
+    while (parent && !visited.has(parent.pid)) {
+      visited.add(parent.pid)
+      if (desktopExecutable(parent.executable)) { row.desktopPid = parent.pid; break }
+      parent = byPid.get(parent.ppid)
+    }
+  }
+  return rows
+}
+
+export const windowsProcessQuery = "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; Get-CimInstance Win32_Process | ForEach-Object { [pscustomobject]@{ ProcessId = $_.ProcessId; ParentProcessId = $_.ParentProcessId; Created = if ($_.CreationDate) { [string]$_.CreationDate.ToFileTimeUtc() } else { $null }; ExecutablePath = $_.ExecutablePath; CommandLine = $_.CommandLine } } | ConvertTo-Json -Compress -Depth 2"
+
 const processTable = (app) => {
   const options = { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, timeout: 2000, env: { ...process.env, LC_ALL: 'C' } }
-  const processes = spawnSync('/bin/ps', ['-axo', 'pid=,ppid=,lstart=,comm='], options)
-  const commands = spawnSync('/bin/ps', ['-axo', 'pid=,ppid=,lstart=,command='], options)
+  const windows = process.platform === 'win32'
+  const processes = windows
+    ? spawnSync(windowsPowerShell(), ['-NoProfile', '-NonInteractive', '-Command', windowsProcessQuery], { ...options, timeout: 20000, windowsHide: true })
+    : spawnSync('/bin/ps', ['-axo', 'pid=,ppid=,lstart=,comm='], options)
+  const commands = windows ? processes : spawnSync('/bin/ps', ['-axo', 'pid=,ppid=,lstart=,command='], options)
   if ([processes, commands].some((result) => result.error || result.status !== 0)) throw new Error('cannot inspect running workers')
   const directory = path.join(os.homedir(), '.claude/sessions')
   let registrations = []
@@ -286,7 +324,7 @@ const processTable = (app) => {
       } catch { return [] }
     })
   } catch {}
-  return parseProcesses(processes.stdout, commands.stdout, app, registrations)
+  return windows ? parseWindowsProcesses(processes.stdout, registrations) : parseProcesses(processes.stdout, commands.stdout, app, registrations)
 }
 const workers = (rows = processTable()) => Object.assign(new Set(rows.filter((row) => row.worker && row.pid !== row.desktopPid).flatMap((row) => row.ids)), { rows })
 const ownsWorker = (live, id, recordId) => Boolean(live?.has(id?.toLowerCase()) || live?.has(recordId?.replace(/^local_/, '').toLowerCase()))
@@ -387,7 +425,7 @@ export async function restartPlan(inv, paths, table = processTable(paths.claudeA
   })
   const selected = new Set(held.flatMap((row) => row.workers.map(processIdentity)))
   const members = table.filter((row) => row.desktopPid === desktop.pid).map(({ pid, started }) => ({ pid, started }))
-  return { app: path.resolve(desktop.executable, '../../..'), desktop: { pid: desktop.pid, started: desktop.started }, members, held, affected,
+  return { app: desktopApp(desktop.executable), desktop: { pid: desktop.pid, started: desktop.started }, members, held, affected,
     interrupts: affected.filter((row, index) => !owned[index].workers.some(worker => selected.has(processIdentity(worker)))), fingerprint: restartFingerprint(desktop, table) }
 }
 
@@ -398,10 +436,23 @@ const waitFor = async (predicate, deadline, now = () => performance.now(), wait 
     await wait(Math.min(250, deadline - now()))
   } while (true)
 }
-const appProcess = (paths, table = processTable(paths.claudeApp)) => table.find((row) => row.executable === path.join(paths.claudeApp, 'Contents/MacOS/Claude'))
+const storeApp = (executable) => executable.match(/\\WindowsApps\\Claude_[^_\\]+_[^_\\]+__([^\\]+)\\/i)?.[1]
+const windowsApp = (app) => typeof app === 'string' && (app.startsWith('shell:AppsFolder\\') || /\.exe$/i.test(app))
+const desktopApp = (executable) => !windowsDesktop.test(executable) ? path.posix.resolve(executable, '../../..')
+  : storeApp(executable) ? `shell:AppsFolder\\Claude_${storeApp(executable)}!Claude` : executable
+const appExecutable = (app, executable) => windowsApp(app)
+  ? windowsDesktop.test(executable ?? '') && (app.startsWith('shell:AppsFolder\\') ? Boolean(storeApp(executable)) : executable.toLowerCase() === app.toLowerCase())
+  : executable === path.posix.join(app, 'Contents/MacOS/Claude')
+const appProcess = (paths, table = processTable(paths.claudeApp)) => table.find((row) => appExecutable(paths.claudeApp, row.executable))
+const windowsRestartManager = "using System; using System.Runtime.InteropServices; using System.Text; public static class RestartManager { [StructLayout(LayoutKind.Sequential)] struct UniqueProcess { public int ProcessId; public uint StartLow; public uint StartHigh; } [DllImport(\"rstrtmgr.dll\", CharSet = CharSet.Unicode)] static extern int RmStartSession(out uint session, int flags, StringBuilder key); [DllImport(\"rstrtmgr.dll\", CharSet = CharSet.Unicode)] static extern int RmRegisterResources(uint session, uint files, string[] names, uint processes, UniqueProcess[] list, uint services, string[] serviceNames); [DllImport(\"rstrtmgr.dll\")] static extern int RmShutdown(uint session, uint flags, IntPtr progress); [DllImport(\"rstrtmgr.dll\")] static extern int RmEndSession(uint session); public static int Close(int id, long start) { uint session; int status = RmStartSession(out session, 0, new StringBuilder(64)); if (status != 0) return status; try { UniqueProcess[] list = { new UniqueProcess { ProcessId = id, StartLow = (uint)start, StartHigh = (uint)(start >> 32) } }; status = RmRegisterResources(session, 0, null, 1, list, 0, null); return status != 0 ? status : RmShutdown(session, 0, IntPtr.Zero); } finally { RmEndSession(session); } } }"
+const powerShell = (script) => [windowsPowerShell(), ['-NoProfile', '-NonInteractive', '-Command', script]]
+export const quitCommand = (app, desktop) => windowsApp(app)
+  ? powerShell(`$ErrorActionPreference = 'Stop'; $process = Get-Process -Id ${Number(desktop.pid)}; if ([DateTimeOffset]::new($process.StartTime).ToUnixTimeMilliseconds() -ne ${Date.parse(desktop.started)}) { exit 3 }; Add-Type -TypeDefinition '${windowsRestartManager}'; exit [RestartManager]::Close($process.Id, $process.StartTime.ToFileTimeUtc())`)
+  : ['/usr/bin/osascript', ['-e', `tell application ${JSON.stringify(app)} to quit`]]
+const openCommand = (app) => windowsApp(app) ? powerShell(`Start-Process '${app.replaceAll("'", "''")}'`) : ['/usr/bin/open', ['-g', '-a', app]]
 const command = (file, args, timeout) => new Promise((resolve) => {
   if (timeout <= 0) return resolve({ status: null, timedOut: true })
-  const child = spawn(file, args, { stdio: 'ignore' })
+  const child = spawn(file, args, { stdio: 'ignore', windowsHide: true })
   let settled = false
   const finish = (result) => { if (!settled) { settled = true; clearTimeout(timer); resolve(result) } }
   const timer = setTimeout(() => { child.kill('SIGTERM'); finish({ status: null, timedOut: true }) }, timeout)
@@ -496,9 +547,9 @@ export async function withDesktopRestart(plan, paths, work, report = () => {}, i
   const check = (force = false) => {
     if (now() - lastProgress >= (io.stallWait ?? STALL_WAIT)) throw Object.assign(new Error('The move stopped making progress'), { code: 'MOVE_STALLED' })
     if (!force && now() < nextInspection) return
-    const possible = io.inspect || spawnSync('/usr/bin/pgrep', ['-x', 'Claude'], { stdio: 'ignore' }).status !== 1
+    const possible = io.inspect || windowsApp(paths.claudeApp) || spawnSync('/usr/bin/pgrep', ['-x', 'Claude'], { stdio: 'ignore' }).status !== 1
     if (possible && appProcess(paths, inspect())) throw Object.assign(new Error('Claude Desktop reopened before the held move finished. Retry the move.'), { code: 'RESTART_REOPENED' })
-    nextInspection = now() + 100
+    nextInspection = now() + (windowsApp(paths.claudeApp) ? 1000 : 100)
     if (now() - lastProgress >= (io.stallWait ?? STALL_WAIT)) throw Object.assign(new Error('The move stopped making progress'), { code: 'MOVE_STALLED' })
   }
   await mkdir(paths.state, { recursive: true, mode: 0o700 })
@@ -512,7 +563,7 @@ export async function withDesktopRestart(plan, paths, work, report = () => {}, i
     if (plan.held.some((held) => live.some((row) => row.worker && row.desktopPid !== desktop.pid && ownsWorker(new Set(row.ids), held.id, held.recordId)))) throw Object.assign(new Error('An external worker now owns a held session. No restart was started.'), { code: 'RESTART_EXTERNAL_WORKER' })
     report('desktop', 'Closing Claude Desktop', { live: true })
     const shutdownDeadline = now() + shutdownWait
-    const quit = await run('/usr/bin/osascript', ['-e', `tell application ${JSON.stringify(paths.claudeApp)} to quit`], Math.max(0, shutdownDeadline - now()))
+    const quit = await run(...quitCommand(paths.claudeApp, plan.desktop), Math.max(0, shutdownDeadline - now()))
     const gone = quit.status === 0 && await waitFor(() => !inspect().some((row) => plan.members.some((prior) => processIdentity(prior) === processIdentity(row))), shutdownDeadline, now, wait)
     if (!gone || quit.status !== 0) {
       state.outcome = quit.timedOut ? 'quit-timeout' : 'quit-not-confirmed'
@@ -523,6 +574,7 @@ export async function withDesktopRestart(plan, paths, work, report = () => {}, i
       state.outcome = 'moving'
       await save()
       await diagnostic('exited')
+      if (windowsApp(paths.claudeApp)) capturedLogin = await (io.captureLogin ?? windowsLogin)(paths).catch(() => null)
       check(true)
       result = await localActivity.run(activity, () => work({ at: state.at, restart: state, check, progress: activity.progress }))
     }
@@ -537,7 +589,7 @@ export async function withDesktopRestart(plan, paths, work, report = () => {}, i
       state.outcome = 'reopening'
       const reopenDeadline = now() + reserve
       const remaining = reopenDeadline - now()
-      const opening = (async () => run('/usr/bin/open', ['-g', '-a', paths.claudeApp], Math.max(1, remaining)))()
+      const opening = (async () => run(...openCommand(paths.claudeApp), Math.max(1, remaining)))()
       try { report('reopen', 'Opening Claude Desktop', { live: true }) } catch {}
       const opened = await opening.catch(() => ({ status: null }))
       const present = await waitFor(() => { const rows = safeInspect(); return rows && Boolean(appProcess(paths, rows)) }, reopenDeadline, now, wait)
@@ -572,16 +624,18 @@ export async function withDesktopRestart(plan, paths, work, report = () => {}, i
   return { result, restart: state, code: stopCode, error: failure?.message ?? state.error, ok: state.outcome === 'reopened' && !state.error && result?.ok !== false }
 }
 
-export function layout(home = os.homedir()) {
-  const support = path.join(home, 'Library/Application Support')
+export function layout(home = os.homedir(), platform = process.platform) {
+  const windows = platform === 'win32'
+  const support = windows ? path.join(home, 'AppData/Roaming') : path.join(home, 'Library/Application Support')
   return {
     home,
     records: path.join(support, 'Claude/claude-code-sessions'),
     agentSessions: path.join(support, 'Claude/local-agent-mode-sessions'),
     desktop: path.join(support, 'Claude/config.json'),
-    logs: path.join(home, 'Library/Logs/Claude'),
-    cookies: path.join(support, 'Claude/Cookies'),
-    claudeApp: '/Applications/Claude.app',
+    logs: windows ? path.join(home, 'AppData/Local/Claude/Logs') : path.join(home, 'Library/Logs/Claude'),
+    cookies: windows ? path.join(support, 'Claude/Network/Cookies') : path.join(support, 'Claude/Cookies'),
+    localState: path.join(support, 'Claude/Local State'),
+    claudeApp: windows ? 'shell:AppsFolder\\Claude_pzs8sxrjxfjjc!Claude' : '/Applications/Claude.app',
     pool: path.join(home, '.claude/projects'),
     login: path.join(home, '.claude.json'),
     backups: path.join(home, '.claude/backups'),
@@ -756,10 +810,18 @@ async function quarantine(items, dest, before = () => {}) {
   }
 }
 
+const windowsPowerShell = () => path.win32.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32\\WindowsPowerShell\\v1.0\\powershell.exe')
+const sharingViolation = -2147024864
+
+export function windowsLockHelper(lockFile) {
+  const quoted = `'${lockFile.replaceAll("'", "''")}'`
+  return [windowsPowerShell(), '-NoProfile', '-NonInteractive', '-Command', `try { $lock = [System.IO.File]::Open(${quoted}, 'OpenOrCreate', 'ReadWrite', 'None') } catch { exit $(if ($_.Exception.GetBaseException().HResult -eq ${sharingViolation}) { 75 } else { 73 }) }; [Console]::Out.Write('ready'); [Console]::Out.Flush(); while ($null -ne [Console]::In.ReadLine()) {}`]
+}
+
 async function locked(paths, work) {
   await mkdir(paths.state, { recursive: true })
   const lockFile = path.join(paths.state, 'lock')
-  const command = await exists('/usr/bin/lockf')
+  const command = process.platform === 'win32' ? windowsLockHelper(lockFile) : await exists('/usr/bin/lockf')
     ? ['/usr/bin/lockf', '-k', '-s', '-w', '-t', '0', lockFile, '/bin/sh', '-c', 'printf ready; cat >/dev/null']
     : ['/usr/bin/perl', '-MFcntl=:flock', '-e', 'open(my $lock, ">>", $ARGV[0]) or exit 73; flock($lock, LOCK_EX | LOCK_NB) or exit($!{EWOULDBLOCK} ? 75 : 73); $| = 1; print "ready"; 1 while <STDIN>;', lockFile]
   const guard = spawn(command[0], command.slice(1), { stdio: ['pipe', 'pipe', 'pipe'] })
@@ -979,7 +1041,7 @@ export async function idleTimeouts(paths, table) {
     const size = Math.min(before.size, 4 * 1024 * 1024), buffer = Buffer.alloc(size)
     const { bytesRead } = await handle.read(buffer, 0, size, before.size - size)
     if (bytesRead !== size) return result
-    const rows = buffer.subarray(0, bytesRead).toString('utf8').split('\n')
+    const rows = buffer.subarray(0, bytesRead).toString('utf8').split(/\r?\n/)
     const recordPattern = new RegExp(`\\[WarmLifecycle:session\\] Starting idle timeout for (local_${UUID_PATTERN}):`, 'i')
     if (size < before.size) rows.shift()
     for (const [index, line] of rows.entries()) {
@@ -1001,6 +1063,7 @@ export async function idleTimeouts(paths, table) {
 export async function signedIn(paths, table = null) {
   const unknown = (state = 'unknown', time = null) => ({ account: null, org: null, state, source: time === null ? 'unknown' : 'log', at: time === null ? null : new Date(time).toISOString() })
   try {
+    if (table === null && process.platform === 'win32') table = processTable(paths.claudeApp)
     if (table === null) {
       const result = spawnSync('/bin/ps', ['-axo', 'pid=,ppid=,lstart=,comm='], { encoding: 'utf8', timeout: 2000, maxBuffer: 16 * 1024 * 1024, env: { ...process.env, LC_ALL: 'C' } })
       if (result.error || result.status !== 0) return unknown()
@@ -1013,7 +1076,7 @@ export async function signedIn(paths, table = null) {
     const files = (await readdir(paths.logs)).filter((name) => /^main(?:[1-9]\d*)?\.log$/.test(name))
       .sort((a, b) => Number(a.slice(4, -4)) - Number(b.slice(4, -4)))
     for (const file of files) {
-      const lines = (await readFile(path.join(paths.logs, file), 'utf8')).split('\n')
+      const lines = (await readFile(path.join(paths.logs, file), 'utf8')).split(/\r?\n/)
       for (let index = lines.length - 1; index >= 0; index--) {
         const line = lines[index]
         const local = line.includes('[LocalSessionManager]')
@@ -1053,7 +1116,25 @@ async function binaryMatch(file, pattern) {
   return null
 }
 
+const windowsExecutable = (app) => {
+  const family = app.match(/^shell:AppsFolder\\([^!]+)!/)?.[1]
+  const locate = family ? `$exe = Join-Path (Get-AppxPackage | Where-Object PackageFamilyName -eq '${family.replaceAll("'", "''")}').InstallLocation 'app\\claude.exe'` : `$exe = '${app.replaceAll("'", "''")}'`
+  const [shell, args] = powerShell(`$ErrorActionPreference = 'Stop'; ${locate}; @{ exe = $exe; version = (Get-Item $exe).VersionInfo.ProductVersion } | ConvertTo-Json -Compress`)
+  const result = spawnSync(shell, args, { encoding: 'utf8', timeout: 20_000, windowsHide: true })
+  if (result.error || result.status !== 0) throw new Error('cannot locate Claude Desktop')
+  return JSON.parse(result.stdout)
+}
+
+export async function windowsUserAgent(app, describe = windowsExecutable) {
+  const { exe, version } = describe(app)
+  const electron = (await readFile(path.join(path.dirname(exe), 'version'), 'utf8').catch(() => '')).trim()
+  const chrome = await binaryMatch(exe, /Chrome\/(\d+\.\d+\.\d+\.\d+)/).catch(() => null)
+  if (!chrome || !/^\d+\.\d+\.\d+$/.test(electron) || !/^\d+(\.\d+)*$/.test(version ?? '')) throw new Error('cannot determine Claude Desktop browser version')
+  return `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Claude/${version} Chrome/${chrome} Electron/${electron} Safari/537.36`
+}
+
 async function desktopUserAgent(paths) {
+  if (windowsApp(paths.claudeApp)) return windowsUserAgent(paths.claudeApp)
   const appInfo = path.join(paths.claudeApp, 'Contents/Info.plist')
   const framework = path.join(paths.claudeApp, 'Contents/Frameworks/Electron Framework.framework/Versions/A')
   const claude = plistValue(appInfo, 'CFBundleShortVersionString')
@@ -1063,35 +1144,75 @@ async function desktopUserAgent(paths) {
   return `Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Claude/${claude} Chrome/${chrome} Electron/${electron} Safari/537.36`
 }
 
-function decryptCookie(host, encrypted, key, version) {
-  if (!encrypted.length || !['v10', 'v11'].includes(encrypted.subarray(0, 3).toString())) throw new Error('unsupported Claude cookie encryption')
-  const decipher = createDecipheriv('aes-128-cbc', key, Buffer.alloc(16, 0x20))
-  const plain = Buffer.concat([decipher.update(encrypted.subarray(3)), decipher.final()])
+const cookieQuery = "SELECT host_key,name,hex(CAST(value AS BLOB)),hex(encrypted_value) FROM cookies WHERE host_key IN ('.claude.ai','claude.ai') ORDER BY length(path) DESC,creation_utc;"
+
+function cookieText(host, plain, version) {
   if (version < 24) return plain.toString('utf8')
   const digest = createHash('sha256').update(host).digest()
   if (!plain.subarray(0, digest.length).equals(digest)) throw new Error('Claude cookie host verification failed')
   return plain.subarray(digest.length).toString('utf8')
 }
 
-function desktopCookies(paths) {
-  const options = { encoding: 'utf8', maxBuffer: 2 * 1024 * 1024, timeout: 10_000 }
-  const versionResult = spawnSync('/usr/bin/sqlite3', ['-readonly', paths.cookies, "SELECT value FROM meta WHERE key='version';"], options)
-  const rowsResult = spawnSync('/usr/bin/sqlite3', ['-readonly', '-separator', '\t', paths.cookies, "SELECT host_key,name,hex(CAST(value AS BLOB)),hex(encrypted_value) FROM cookies WHERE host_key IN ('.claude.ai','claude.ai') ORDER BY length(path) DESC,creation_utc;"], options)
-  const secretResult = spawnSync('/usr/bin/security', ['find-generic-password', '-w', '-s', 'Claude Safe Storage'], options)
-  if ([versionResult, rowsResult, secretResult].some((result) => result.error || result.status !== 0)) throw new Error('cannot read Claude Desktop login')
-  const version = Number(versionResult.stdout.trim())
-  const password = secretResult.stdout.trimEnd()
-  const key = pbkdf2Sync(password, 'saltysalt', 1003, 16, 'sha1')
+function decryptCookie(host, encrypted, key, version) {
+  if (!encrypted.length || !['v10', 'v11'].includes(encrypted.subarray(0, 3).toString())) throw new Error('unsupported Claude cookie encryption')
+  const decipher = createDecipheriv('aes-128-cbc', key, Buffer.alloc(16, 0x20))
+  return cookieText(host, Buffer.concat([decipher.update(encrypted.subarray(3)), decipher.final()]), version)
+}
+
+function decryptWindowsCookie(host, encrypted, key, version) {
+  if (encrypted.length < 31 || encrypted.subarray(0, 3).toString() !== 'v10') throw new Error('unsupported Claude cookie encryption')
+  const decipher = createDecipheriv('aes-256-gcm', key, encrypted.subarray(3, 15))
+  decipher.setAuthTag(encrypted.subarray(-16))
+  return cookieText(host, Buffer.concat([decipher.update(encrypted.subarray(15, -16)), decipher.final()]), version)
+}
+
+function loginCookies(rows, decrypt) {
   const values = new Map()
-  for (const line of rowsResult.stdout.split('\n').filter(Boolean)) {
-    const [host, name, plainHex, encryptedHex] = line.split('\t')
+  for (const [host, name, plainHex, encryptedHex] of rows) {
     if (!/^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/.test(name ?? '')) continue
-    const value = plainHex ? Buffer.from(plainHex, 'hex').toString('utf8') : decryptCookie(host, Buffer.from(encryptedHex, 'hex'), key, version)
+    const value = plainHex ? Buffer.from(plainHex, 'hex').toString('utf8') : decrypt(host, Buffer.from(encryptedHex, 'hex'))
     if (value && !/[;\r\n]/.test(value)) values.set(name, value)
   }
   if (!values.has('sessionKey')) throw Object.assign(new Error('Claude Desktop login is still updating'), { code: 'CLOUD_AUTH_PENDING' })
   return values
 }
+
+function macCookies(paths) {
+  const options = { encoding: 'utf8', maxBuffer: 2 * 1024 * 1024, timeout: 10_000 }
+  const versionResult = spawnSync('/usr/bin/sqlite3', ['-readonly', paths.cookies, "SELECT value FROM meta WHERE key='version';"], options)
+  const rowsResult = spawnSync('/usr/bin/sqlite3', ['-readonly', '-separator', '\t', paths.cookies, cookieQuery], options)
+  const secretResult = spawnSync('/usr/bin/security', ['find-generic-password', '-w', '-s', 'Claude Safe Storage'], options)
+  if ([versionResult, rowsResult, secretResult].some((result) => result.error || result.status !== 0)) throw new Error('cannot read Claude Desktop login')
+  const version = Number(versionResult.stdout.trim())
+  const key = pbkdf2Sync(secretResult.stdout.trimEnd(), 'saltysalt', 1003, 16, 'sha1')
+  return loginCookies(rowsResult.stdout.split('\n').filter(Boolean).map(line => line.split('\t')), (host, encrypted) => decryptCookie(host, encrypted, key, version))
+}
+
+export function windowsUnprotect(blob) {
+  const result = spawnSync(windowsPowerShell(), ['-NoProfile', '-NonInteractive', '-Command', "Add-Type -AssemblyName System.Security; [Convert]::ToBase64String([System.Security.Cryptography.ProtectedData]::Unprotect([Convert]::FromBase64String([Console]::In.ReadToEnd().Trim()), $null, 'CurrentUser'))"],
+    { input: blob.toString('base64'), encoding: 'utf8', timeout: 20_000, windowsHide: true })
+  if (result.error || result.status !== 0 || !result.stdout.trim()) throw new Error('cannot read Claude Desktop login')
+  return Buffer.from(result.stdout.trim(), 'base64')
+}
+
+export async function windowsLogin(paths, unprotect = windowsUnprotect) {
+  const wrapped = Buffer.from((await readJson(paths.localState).catch(() => null))?.os_crypt?.encrypted_key ?? '', 'base64')
+  if (wrapped.subarray(0, 5).toString() !== 'DPAPI' || !(await exists(paths.cookies))) throw new Error('cannot read Claude Desktop login')
+  const { DatabaseSync } = await import('node:sqlite')
+  let db, version, rows
+  try {
+    db = new DatabaseSync(paths.cookies, { readOnly: true })
+    version = Number(db.prepare("SELECT value FROM meta WHERE key='version'").get()?.value)
+    rows = db.prepare(cookieQuery).all().map(Object.values)
+  } catch {
+    throw Object.assign(new Error('Claude Desktop holds its login while it runs. Cloud work continues after Desktop restarts.'), { code: 'CLOUD_AUTH_PENDING' })
+  } finally { db?.close() }
+  const key = unprotect(wrapped.subarray(5))
+  return loginCookies(rows, (host, encrypted) => decryptWindowsCookie(host, encrypted, key, version))
+}
+
+let capturedLogin = null
+const desktopCookies = (paths) => process.platform === 'win32' ? capturedLogin ?? windowsLogin(paths) : macCookies(paths)
 
 const wireRemoteId = (id) => {
   if (!/^(?:cse|session)_[A-Za-z0-9_-]+$/.test(id ?? '')) throw new Error('invalid Remote Control session id')
@@ -1108,7 +1229,7 @@ export async function cloudClient(paths, expected = null, io = {}) {
   if (current.state === 'logged-out') throw new Error('Claude Desktop is signed out')
   if (expected && current.state === 'known' && !sameLogin(expected, current)) throw new Error(`sign Claude Desktop into ${loginLabel(expected)}`)
   const selected = expected ?? (current.state === 'known' ? current : null)
-  const cookies = io.cookies ?? desktopCookies(paths)
+  const cookies = io.cookies ?? await desktopCookies(paths)
   const cookie = [...cookies].map(([name, value]) => `${name}=${value}`).join('; ')
   const userAgent = io.userAgent ?? await desktopUserAgent(paths)
   const baseHeaders = {
@@ -2938,6 +3059,7 @@ async function deferredWorkflow(paths, latest) {
 }
 
 const syncPath = async file => {
+  if (process.platform === 'win32') return
   const handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW)
   try { await handle.sync() } finally { await handle.close() }
 }
@@ -3318,7 +3440,7 @@ async function reconcile(paths, options = {}) {
       const running = () => { try { return Boolean(appProcess(paths, inspect())) } catch { return false } }
       if (!running()) {
         const deadline = now() + REOPEN_RESERVE
-        const opened = await (io.command ?? command)('/usr/bin/open', ['-g', '-a', paths.claudeApp], REOPEN_RESERVE)
+        const opened = await (io.command ?? command)(...openCommand(paths.claudeApp), REOPEN_RESERVE)
         restart.outcome = opened.status === 0 && await waitFor(running, deadline, now, io.wait) ? 'interrupted-reopened' : 'reopen-failed'
       } else restart.outcome = 'interrupted-app-running'
       restart.recoveredAt = new Date().toISOString()
@@ -4719,7 +4841,7 @@ export function executeMove(from, to, paths, options = {}) {
       }
       let prepared = null, pendingPlan = plan
       if (initial) {
-        const live = inspect(), desktop = appProcess(paths, live)
+        const live = inspect(), desktop = appProcess({ ...paths, claudeApp: plan.app ?? paths.claudeApp }, live)
         if (!desktop || restartFingerprint(desktop, live) !== plan.fingerprint) return { ok: false, code: 'RESTART_PLAN_CHANGED', reason: 'Open Claude sessions changed. Review the restart plan again.' }
         const current = await restartPlan(initial.inv, paths, live)
         const held = [...(current?.held ?? [])]
@@ -5095,7 +5217,53 @@ const compileMenubar = (source, binary) => {
   if (build.status !== 0) throw new Error(`swiftc failed\n${build.stderr.trim()}`)
 }
 
+const windowsSystem = (...parts) => path.win32.join(process.env.SystemRoot ?? 'C:\\Windows', ...parts)
+
+async function windowsTray(paths, remove, snapshot) {
+  if (snapshot) throw new Error('menubar --snapshot renders the macOS panel only')
+  const tray = path.join(paths.state, 'tray')
+  const binary = path.join(tray, 'Claude Transplant.exe')
+  const shortcut = path.join(paths.home, 'AppData/Roaming/Microsoft/Windows/Start Menu/Programs/Startup/Claude Transplant.lnk')
+  const stop = () => spawnSync(windowsSystem('System32', 'taskkill.exe'), ['/F', '/IM', 'Claude Transplant.exe'], { stdio: 'ignore', windowsHide: true })
+  if (remove) {
+    stop()
+    await rm(tray, { recursive: true, force: true })
+    await rm(shortcut, { force: true })
+    return 'tray removed'
+  }
+  const source = path.join(HERE, 'tray.cs')
+  const key = sha((await readFile(source, 'utf8')) + VERSION)
+  const built = path.join(tray, 'build.sha256')
+  const fresh = `${tray}.building`
+  const rebuild = (await readFile(built, 'utf8').catch(() => '')) !== key
+  if (rebuild) {
+    await rm(fresh, { recursive: true, force: true })
+    await mkdir(fresh, { recursive: true })
+    const build = spawnSync(windowsSystem('Microsoft.NET', 'Framework64', 'v4.0.30319', 'csc.exe'), ['-nologo', '-target:winexe', '-optimize',
+      `-out:${path.join(fresh, 'Claude Transplant.exe')}`, '-r:System.Web.Extensions.dll', '-r:System.Windows.Forms.dll', '-r:System.Drawing.dll', source], { encoding: 'utf8', windowsHide: true })
+    if (build.error) throw new Error('the .NET Framework 4 compiler (csc.exe) was not found')
+    if (build.status !== 0) throw new Error(`csc failed\n${(build.stdout + build.stderr).trim()}`)
+    await writeFile(path.join(fresh, 'build.sha256'), key)
+  }
+  stop()
+  if (rebuild) {
+    await rm(tray, { recursive: true, force: true })
+    await rename(fresh, tray)
+  }
+  const script = path.join(tray, 'transplant.js')
+  await copyFile(path.join(HERE, 'transplant.js'), script)
+  await writeFile(path.join(tray, 'package.json'), jsonText({ type: 'module', version: VERSION }))
+  await writeFile(path.join(tray, 'tray.json'), jsonText({ node: process.execPath, script, nodeArgs: [`--max-old-space-size=${menubarHeapMiB()}`] }))
+  await mkdir(path.dirname(shortcut), { recursive: true })
+  const quoted = (text) => `'${text.replaceAll("'", "''")}'`
+  const shortcutResult = spawnSync(windowsPowerShell(), ['-NoProfile', '-NonInteractive', '-Command', `$link = (New-Object -ComObject WScript.Shell).CreateShortcut(${quoted(shortcut)}); $link.TargetPath = ${quoted(binary)}; $link.WorkingDirectory = ${quoted(tray)}; $link.Save()`], { encoding: 'utf8', windowsHide: true })
+  if (shortcutResult.error || shortcutResult.status !== 0) throw new Error(`could not create the Startup shortcut: ${(shortcutResult.stderr || '').trim()}`)
+  spawn(binary, [], { detached: true, stdio: 'ignore', cwd: tray }).unref()
+  return `tray installed | starts at sign-in | ${tray}`
+}
+
 async function menubar(paths, remove, snapshot) {
+  if (process.platform === 'win32') return windowsTray(paths, remove, snapshot)
   const app = path.join(paths.state, 'Claude Transplant.app')
   const binary = path.join(app, 'Contents/MacOS/Claude Transplant')
   const agent = path.join(paths.home, 'Library/LaunchAgents', `${LABEL}.plist`)
