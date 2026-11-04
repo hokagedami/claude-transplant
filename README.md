@@ -92,7 +92,7 @@ Prefer the terminal? `npx github:hokagedami/claude-transplant` opens the same pi
 npx github:hokagedami/claude-transplant menubar --remove
 ```
 
-This removes the tray and its Startup shortcut. Receipts and quarantine stay in `%APPDATA%\claude-transplant`. Delete that folder only when you no longer need `undo`.
+This removes the tray and its Startup shortcut. Receipts and quarantine stay in the tool's folder, `claude-transplant` beside Desktop's data (see [What each command touches](#what-each-command-touches)). Delete that folder only when you no longer need `undo`.
 
 **If something goes wrong:**
 
@@ -117,14 +117,15 @@ This removes the tray and its Startup shortcut. Receipts and quarantine stay in 
 The Windows counterpart of the menubar, a small tray app with the same moves.
 
 - `npx github:hokagedami/claude-transplant menubar` builds a tray app with `csc.exe`, adds a Startup shortcut and starts it. `menubar --remove` stops it and removes both.
-- The menu lists each account with its session count, the signed-in account, and work that is waiting. Move sessions… picks the destination and the accounts to take from, then moves with `--cloud`.
+- The menu lists each account with its session count, the signed-in account, and work that is waiting. Move sessions… asks for the accounts to move from first, then the one to move to, and spells the move out before you confirm, for example Moves 100 sessions from Company to Personal. Like the macOS panel, it starts with the signed-in account as the source and the most recently used other account as the destination. It moves with `--cloud`.
 - A move that needs Desktop closed asks first and names the open chats that will stop: Restart and move, Move the others only, or Cancel.
-- Finish, Keep local and Undo last move run the same CLI commands. Progress shows in the icon's tooltip and the result as a notification.
+- Finish, Keep local and Undo last move run the same CLI commands.
+- Each run opens a progress window with a bar, the percentage and sessions left, and the current step, such as Closing Claude Desktop or Moving sessions 12/37. The percentage is weighted like the macOS panel's, so the local move fills the first part and cloud cleanup the rest. Hide keeps it running in the background, Show progress in the menu brings it back, and it ends with the result and a Close button. The result also shows as a notification.
 - Left or right click the icon to open the menu: Move sessions…, Finish, Keep local, Undo last move, Refresh and Quit. Items that don't apply right now are greyed out.
 - Starts at login through the Startup shortcut. Turn that off in Settings › Apps › Startup, or with `menubar --remove`.
 - Quit while a move runs asks first. The move continues and `finish` picks it up later.
 - Bundles its own CLI, so rerun `menubar` after upgrading. The macOS panel's demo, snapshot and update notice are not part of the tray.
-- Files live in `%APPDATA%\claude-transplant\tray`. The CLI and receipts are shared with the tray, so either can undo the other's move.
+- Files live in the `tray` folder inside the tool's folder. The CLI and receipts are shared with the tray, so either can undo the other's move.
 
 ## CLI
 
@@ -161,7 +162,7 @@ To    ↑↓ move · enter confirm
 
 ## What each command touches
 
-Every command may write the tool's own folder, `~/Library/Application Support/claude-transplant` or `%APPDATA%\claude-transplant` on Windows: cache, lock, restart plan and diagnostics, receipts, quarantine and drift evidence. A move, `finish`, `sweep`, `undo` and `restart` first finish interrupted work, which can move records, rewrite the receipt and reopen Claude Desktop. `--dry-run` and `keep-local` refuse during recovery.
+Every command may write the tool's own folder, `~/Library/Application Support/claude-transplant` on macOS. On Windows it sits beside Desktop's data folder, so it is `%LOCALAPPDATA%\Claude-Data\claude-transplant`, `%LOCALAPPDATA%\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Roaming\claude-transplant` or `%APPDATA%\claude-transplant` (see How it works). It holds cache, lock, restart plan and diagnostics, receipts, quarantine and drift evidence. A move, `finish`, `sweep`, `undo` and `restart` first finish interrupted work, which can move records, rewrite the receipt and reopen Claude Desktop. `--dry-run` and `keep-local` refuse during recovery.
 
 | Command | Beyond the tool's own folder |
 |---|---|
@@ -181,7 +182,7 @@ Command and flag names are stable. Renames get a deprecation release first.
 
 ### Why is the Code sidebar empty after switching accounts?
 
-Desktop keeps one record per session under `~/Library/Application Support/Claude/claude-code-sessions/<account>/<organization>`, or `%APPDATA%\Claude\claude-code-sessions\<account>\<organization>` on Windows, and lists only the signed-in folder. The transcripts in `~/.claude/projects`, `%USERPROFILE%\.claude\projects` on Windows, are shared by every account.
+Desktop keeps one record per session under `~/Library/Application Support/Claude/claude-code-sessions/<account>/<organization>`, or `claude-code-sessions\<account>\<organization>` in Desktop's data folder on Windows, and lists only the signed-in folder. The transcripts in `~/.claude/projects`, `%USERPROFILE%\.claude\projects` on Windows, are shared by every account.
 
 ### My sessions disappeared after signing out, an update, or a reset. Is this the fix?
 
@@ -225,7 +226,7 @@ Manual walkthrough: [recovering missing Claude Desktop history](https://dev.to/v
 
 ## How it works
 
-A session is three files: the transcript in `~/.claude/projects`, the sidecar directory beside it, and the record under `~/Library/Application Support/Claude/claude-code-sessions/<account>/<organization>` (`%APPDATA%\Claude\claude-code-sessions` on Windows). A move leaves the transcript and sidecars in place, writes and verifies the destination record with the same `cliSessionId`, then parks the source record in quarantine.
+A session is three files: the transcript in `~/.claude/projects`, the sidecar directory beside it, and the record under `~/Library/Application Support/Claude/claude-code-sessions/<account>/<organization>` (`claude-code-sessions` in Desktop's data folder on Windows). A move leaves the transcript and sidecars in place, writes and verifies the destination record with the same `cliSessionId`, then parks the source record in quarantine.
 
 Eligibility:
 
@@ -254,7 +255,11 @@ Remote Control (`--cloud`):
 
 Windows:
 
-- Records, config and cookies are under `%APPDATA%\Claude`. Desktop 4.4212.0 logs to `%LOCALAPPDATA%\Claude\Logs` with CRLF line endings. The older `%APPDATA%\Claude\logs` stops at the version that moved them.
+- Desktop's data folder holds records, config, cookies and `Local State`, and its place differs between installs of the same Desktop. Two machines with MSIX `Claude_pzs8sxrjxfjjc` 4.16336.0 used two places:
+  - `%LOCALAPPDATA%\Claude-Data\claude_pzs8sxrjxfjjc`, which Desktop was launched with as `--user-data-dir`. The package exempts `Claude-Data` from file virtualization.
+  - `%LOCALAPPDATA%\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Roaming\Claude`. Here Desktop wrote to `%APPDATA%\Claude` under MSIX file virtualization, which redirects into the package folder. Processes outside the package see only the real `%APPDATA%\Claude`, missing or stale, while Claude Code inside Desktop sees both merged.
+- The tool takes the first of `Claude-Data\<profile>`, the package's `LocalCache\Roaming\Claude` and `%APPDATA%\Claude` that holds `config.json` or `claude-code-sessions`, read through its real path. The CLI, the tray at sign-in and Claude Code inside Desktop then use the same files, and a stale copy left by an earlier location is never preferred.
+- Logs are exempt from virtualization. 4.4212.0 logs to `%LOCALAPPDATA%\Claude\Logs` with CRLF line endings, and a data folder can carry its own `logs`. The tool reads whichever `main.log` is newer. The older `%APPDATA%\Claude\logs` stops at the version that moved them.
 - Processes come from `Win32_Process`. Desktop's Electron helpers share its `claude.exe` and carry `--type=`, so they are neither Desktop nor workers. Code workers register as `win32:<host>` with a FILETIME start, matched to the millisecond.
 - Desktop quits through Restart Manager for its exact PID and start time, the request Desktop builds from August and September 2026 logged as "Windows session ending (close-app) - quitting the app". It is never killed. It reopens through its Store app id, or its `claude.exe` for other installs.
 - The kernel lock is an exclusive handle held by a PowerShell helper and released when it exits.
@@ -353,6 +358,6 @@ The active badge comes from Desktop's own `main.log`, with no Keychain read or n
 | 4.1.5 | 27.0.1 | 3.6556.2 | 2.1.308 | 2026-10-26 |
 | 4.1.4 | 27.0.1 | 3.6556.2 | 2.1.308 | 2026-10-26 |
 
-4.1.5 and 4.1.6 were validated with synthetic fixtures and read-only code inspection, without a new live move. The Windows row passed the full suite and read-only checks against a live Desktop, accounts, signed-in identity, the process table, the user agent and the locked cookie store, without a live move. 4.2.0 moved 499 sessions to another account and back through the menubar, and its final panel was checked with state tests and renders of live data.
+4.1.5 and 4.1.6 were validated with synthetic fixtures and read-only code inspection, without a new live move. The Windows row passed the full suite and read-only checks against a live Desktop, accounts, signed-in identity, the process table, the user agent and the locked cookie store, without a live move. On Desktop 4.16336.0 the data folder lookup was checked on two machines, one using `Claude-Data` and one using the package folder, by listing accounts and session counts from outside Desktop and installing the tray, without a live move. 4.2.0 moved 499 sessions to another account and back through the menubar, and its final panel was checked with state tests and renders of live data.
 
 Delete `quarantine` once its receipts are no longer wanted. A kernel lock prevents overlapping runs. MIT.

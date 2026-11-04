@@ -241,6 +241,73 @@ test('layout places Claude Desktop and transplant state per platform inside the 
   assert.equal(windows.claudeApp, 'shell:AppsFolder\\Claude_pzs8sxrjxfjjc!Claude')
 })
 
+test('layout follows the Microsoft Store build of Claude Desktop into its package folder', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ct-store-'))
+  const roaming = path.join(root, 'AppData', 'Roaming')
+  const packaged = path.join(root, 'AppData', 'Local', 'Packages', 'Claude_pzs8sxrjxfjjc', 'LocalCache', 'Roaming')
+  await mkdir(path.join(roaming, 'Claude'), { recursive: true })
+  assert.equal(layout(root, 'win32').records, path.join(roaming, 'Claude', 'claude-code-sessions'))
+  assert.equal(layout(root, 'win32').state, path.join(roaming, 'claude-transplant'))
+  await mkdir(path.join(packaged, 'Claude'), { recursive: true })
+  assert.equal(layout(root, 'win32').records, path.join(roaming, 'Claude', 'claude-code-sessions'))
+  await writeFile(path.join(packaged, 'Claude', 'config.json'), '{}')
+  const store = layout(root, 'win32')
+  assert.deepEqual({ records: store.records, agentSessions: store.agentSessions, desktop: store.desktop, cookies: store.cookies, localState: store.localState, state: store.state, logs: store.logs, login: store.login },
+    { records: path.join(packaged, 'Claude', 'claude-code-sessions'), agentSessions: path.join(packaged, 'Claude', 'local-agent-mode-sessions'), desktop: path.join(packaged, 'Claude', 'config.json'),
+      cookies: path.join(packaged, 'Claude', 'Network', 'Cookies'), localState: path.join(packaged, 'Claude', 'Local State'), state: path.join(packaged, 'claude-transplant'),
+      logs: path.join(root, 'AppData', 'Local', 'Claude', 'Logs'), login: path.join(root, '.claude.json') })
+  assert.equal(layout(root, 'darwin').records, path.join(root, 'Library/Application Support/Claude/claude-code-sessions'))
+})
+
+test('layout follows Desktop data relocated to Claude-Data and reads the newest Desktop log', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ct-relocated-'))
+  const local = path.join(root, 'AppData', 'Local')
+  const packagedClaude = path.join(local, 'Packages', 'Claude_pzs8sxrjxfjjc', 'LocalCache', 'Roaming', 'Claude')
+  const relocated = path.join(local, 'Claude-Data', 'claude_pzs8sxrjxfjjc')
+  await mkdir(path.join(packagedClaude, 'claude-code-sessions'), { recursive: true })
+  await writeFile(path.join(packagedClaude, 'config.json'), '{}')
+  await mkdir(path.join(local, 'Claude-Data', 'unrelated'), { recursive: true })
+  assert.equal(layout(root, 'win32').records, path.join(packagedClaude, 'claude-code-sessions'))
+  await mkdir(path.join(relocated, 'claude-code-sessions'), { recursive: true })
+  const moved = layout(root, 'win32')
+  assert.deepEqual({ records: moved.records, agentSessions: moved.agentSessions, desktop: moved.desktop, cookies: moved.cookies, localState: moved.localState, state: moved.state },
+    { records: path.join(relocated, 'claude-code-sessions'), agentSessions: path.join(relocated, 'local-agent-mode-sessions'), desktop: path.join(relocated, 'config.json'),
+      cookies: path.join(relocated, 'Network', 'Cookies'), localState: path.join(relocated, 'Local State'), state: path.join(local, 'Claude-Data', 'claude-transplant') })
+  const sharedLogs = path.join(local, 'Claude', 'Logs'), profileLogs = path.join(relocated, 'logs')
+  assert.equal(moved.logs, sharedLogs)
+  await mkdir(sharedLogs, { recursive: true })
+  await mkdir(profileLogs, { recursive: true })
+  await writeFile(path.join(sharedLogs, 'main.log'), 'older\r\n')
+  await writeFile(path.join(profileLogs, 'main.log'), 'newer\r\n')
+  const hourAgo = new Date(Date.now() - 3600000)
+  await fs.utimes(path.join(sharedLogs, 'main.log'), hourAgo, hourAgo)
+  assert.equal(layout(root, 'win32').logs, profileLogs)
+  await fs.utimes(path.join(profileLogs, 'main.log'), new Date(Date.now() - 7200000), new Date(Date.now() - 7200000))
+  assert.equal(layout(root, 'win32').logs, sharedLogs)
+})
+
+test('accounts count the sessions the Store build keeps in its package folder, not a stale roaming copy', { skip: process.platform !== 'win32' }, async () => {
+  const h = await home()
+  for (const sid of [id(9601), id(9602)]) await h.record('P', sid)
+  await h.record('T', id(9603))
+  const counts = async () => JSON.parse((await cli(h.root, ['accounts', '--json'])).stdout).map(row => `${row.account}/${row.org}=${row.sessions}`).sort()
+  const before = await counts()
+  assert.ok(before.includes(`${h.acct.P}/${h.org.P}=2`), before.join(' '))
+  const roamingClaude = path.join(h.root, 'AppData', 'Roaming', 'Claude')
+  const packagedClaude = path.join(h.root, 'AppData', 'Local', 'Packages', 'Claude_pzs8sxrjxfjjc', 'LocalCache', 'Roaming', 'Claude')
+  await mkdir(path.dirname(packagedClaude), { recursive: true })
+  await rename(roamingClaude, packagedClaude)
+  await mkdir(path.join(roamingClaude, 'claude-code-sessions'), { recursive: true })
+  await writeFile(path.join(roamingClaude, 'config.json'), JSON.stringify({ lastKnownAccountUuid: h.acct.T }))
+  assert.deepEqual(await counts(), before)
+  const relocatedClaude = path.join(h.root, 'AppData', 'Local', 'Claude-Data', 'claude_pzs8sxrjxfjjc')
+  await mkdir(path.dirname(relocatedClaude), { recursive: true })
+  await fs.cp(packagedClaude, relocatedClaude, { recursive: true })
+  await fs.rm(path.join(packagedClaude, 'claude-code-sessions'), { recursive: true })
+  await mkdir(path.join(packagedClaude, 'claude-code-sessions'))
+  assert.deepEqual(await counts(), before)
+})
+
 test('Windows process identity separates Desktop helpers, descendants, external workers, and reused pids', () => {
   const desktop = 'C:\\Program Files\\WindowsApps\\Claude_4.4212.0.0_x64__pzs8sxrjxfjjc\\app\\claude.exe'
   const worker = 'C:\\Users\\fixture\\AppData\\Roaming\\Claude\\claude-code\\2.1.309\\9078b9c1d466\\claude.exe'
@@ -11800,6 +11867,60 @@ test('Windows tray installation builds once, starts at sign-in and removes clean
   assert.match(snapshot.stderr + snapshot.stdout, /snapshot.*macOS/)
 })
 
+test('with the Store build the tray lives beside Desktop data and a roaming tray from an older install is cleared', { skip: process.platform !== 'win32' }, async () => {
+  const h = await home()
+  const packaged = path.join(h.root, 'AppData', 'Local', 'Packages', 'Claude_pzs8sxrjxfjjc', 'LocalCache', 'Roaming')
+  await mkdir(packaged, { recursive: true })
+  await rename(path.join(h.root, 'AppData', 'Roaming', 'Claude'), path.join(packaged, 'Claude'))
+  const legacy = path.join(h.root, 'AppData', 'Roaming', 'claude-transplant')
+  await mkdir(path.join(legacy, 'tray'), { recursive: true })
+  await writeFile(path.join(legacy, 'tray', 'Claude Transplant.exe'), 'older tray')
+  await writeFile(path.join(legacy, '2026-11-01T00-00-00-000.json'), '{}')
+  const shortcuts = path.join(h.root, 'native-shortcuts.txt')
+  const setup = `
+    import { appendFileSync, writeFileSync } from 'node:fs'
+    const syntheticSpawn = childProcess.spawnSync, syntheticAsync = childProcess.spawn
+    childProcess.spawnSync = (file, args, ...rest) => {
+      if (/csc\\.exe$/i.test(file)) { writeFileSync(args.find(arg => arg.startsWith('-out:')).slice(5), 'synthetic tray'); return { status: 0, stdout: '', stderr: '' } }
+      if (/taskkill\\.exe$/i.test(file)) return { status: 0, stdout: '', stderr: '' }
+      if (/powershell\\.exe$/i.test(file) && /WScript\\.Shell/.test(args.at(-1))) { appendFileSync(${JSON.stringify(shortcuts)}, args.at(-1) + '\\n'); return { status: 0, stdout: '', stderr: '' } }
+      return syntheticSpawn(file, args, ...rest)
+    }
+    childProcess.spawn = (file, args, ...rest) => /Claude Transplant\\.exe$/i.test(file) ? { unref: () => {}, on: () => {}, once: () => {} } : syntheticAsync(file, args, ...rest)
+  `
+  const installed = await cli(h.root, ['menubar'], setup)
+  assert.equal(installed.code, 0, installed.stderr)
+  const tray = path.join(packaged, 'claude-transplant', 'tray')
+  assert.equal(await readFile(path.join(tray, 'Claude Transplant.exe'), 'utf8'), 'synthetic tray')
+  assert.ok((await readFile(shortcuts, 'utf8')).includes(path.join(tray, 'Claude Transplant.exe')))
+  assert.equal(await stat(path.join(legacy, 'tray')).catch(() => null), null)
+  assert.equal(await readFile(path.join(legacy, '2026-11-01T00-00-00-000.json'), 'utf8'), '{}')
+  await mkdir(path.join(legacy, 'tray'), { recursive: true })
+  const removed = await cli(h.root, ['menubar', '--remove'], setup)
+  assert.equal(removed.code, 0, removed.stderr)
+  assert.equal(await stat(tray).catch(() => null), null)
+  assert.equal(await stat(path.join(legacy, 'tray')).catch(() => null), null)
+  await fs.rm(legacy, { recursive: true, force: true })
+  await symlink(path.join(packaged, 'claude-transplant'), legacy, 'junction')
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const merged = await cli(h.root, ['menubar'], setup)
+    assert.equal(merged.code, 0, merged.stderr)
+    assert.equal(await readFile(path.join(tray, 'Claude Transplant.exe'), 'utf8'), 'synthetic tray')
+    assert.equal(await readFile(path.join(tray, 'transplant.js'), 'utf8'), await readFile(path.join(here, 'transplant.js'), 'utf8'))
+  }
+  const relocated = path.join(h.root, 'AppData', 'Local', 'Claude-Data')
+  await mkdir(path.join(relocated, 'claude_pzs8sxrjxfjjc', 'claude-code-sessions'), { recursive: true })
+  const moved = await cli(h.root, ['menubar'], setup)
+  assert.equal(moved.code, 0, moved.stderr)
+  const relocatedTray = path.join(relocated, 'claude-transplant', 'tray')
+  assert.equal(await readFile(path.join(relocatedTray, 'Claude Transplant.exe'), 'utf8'), 'synthetic tray')
+  assert.ok((await readFile(shortcuts, 'utf8')).trim().split('\n').at(-1).includes(path.join(relocatedTray, 'Claude Transplant.exe')))
+  assert.equal(await stat(tray).catch(() => null), null)
+  const relocatedRemoved = await cli(h.root, ['menubar', '--remove'], setup)
+  assert.equal(relocatedRemoved.code, 0, relocatedRemoved.stderr)
+  assert.equal(await stat(relocatedTray).catch(() => null), null)
+})
+
 test('the Windows tray compiles and describes accounts, sessions and waiting work', { skip: process.platform !== 'win32' }, async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'transplant-tray-')), exe = path.join(dir, 'tray.exe'), sample = path.join(dir, 'accounts.json')
   const build = spawnSync(path.win32.join(process.env.SystemRoot, 'Microsoft.NET', 'Framework64', 'v4.0.30319', 'csc.exe'),
@@ -11813,6 +11934,59 @@ test('the Windows tray compiles and describes accounts, sessions and waiting wor
     'u@example.com', '  Undo waiting, sign Claude into this account'])
   await writeFile(sample, '[]')
   assert.equal(spawnSync(exe, ['--describe', sample], { encoding: 'utf8' }).stdout, 'No Claude Desktop accounts found')
+})
+
+test('the Windows tray move window starts from the signed-in account toward the most recent other one', { skip: process.platform !== 'win32' }, async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'transplant-tray-')), exe = path.join(dir, 'tray.exe'), sample = path.join(dir, 'accounts.json')
+  const build = spawnSync(path.win32.join(process.env.SystemRoot, 'Microsoft.NET', 'Framework64', 'v4.0.30319', 'csc.exe'),
+    ['-nologo', '-target:winexe', `-out:${exe}`, '-r:System.Web.Extensions.dll', '-r:System.Windows.Forms.dll', '-r:System.Drawing.dll', path.join(here, 'tray.cs')], { encoding: 'utf8' })
+  assert.equal(build.status, 0, build.stdout + build.stderr)
+  const now = Date.now()
+  const plan = async (rows) => {
+    await writeFile(sample, JSON.stringify(rows))
+    const result = spawnSync(exe, ['--move-plan', sample], { encoding: 'utf8' })
+    assert.equal(result.status, 0, result.stderr)
+    return result.stdout.split('\n')
+  }
+  const company = { account: 'c', org: 'o', label: 'm@company.example · Company', sessions: 100, active: true, signedIn: true, activeAt: now - 2 * 3600000 }
+  const personal = { account: 'p', org: 'q', label: 'm@home.example · Personal', sessions: 6, activeAt: now - 30 * 86400000 }
+  assert.deepEqual(await plan([personal, company]), ['to: m@home.example · Personal', 'from: m@company.example · Company', 'Moves 100 sessions from m@company.example · Company to m@home.example · Personal', 'button: Move 100 sessions'])
+  const newer = { account: 'n', org: 'r', label: 'n@example.com · Newer', sessions: 1, activeAt: now - 60000 }
+  const empty = { account: 'e', org: 's', label: 'e@example.com · Empty', sessions: 0, activeAt: null }
+  assert.deepEqual(await plan([company, personal, newer, empty]), ['to: n@example.com · Newer', 'from: m@company.example · Company', 'from: m@home.example · Personal', 'Moves 106 sessions from 2 accounts to n@example.com · Newer', 'button: Move 106 sessions'])
+  assert.deepEqual(await plan([{ ...company, active: false }, personal]), ['to: none', 'Choose the account to move sessions to', 'button: Move'])
+})
+
+test('the Windows tray progress window follows move events to a finished summary', { skip: process.platform !== 'win32' }, async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'transplant-tray-')), exe = path.join(dir, 'tray.exe'), events = path.join(dir, 'events.jsonl')
+  const build = spawnSync(path.win32.join(process.env.SystemRoot, 'Microsoft.NET', 'Framework64', 'v4.0.30319', 'csc.exe'),
+    ['-nologo', '-target:winexe', `-out:${exe}`, '-r:System.Web.Extensions.dll', '-r:System.Windows.Forms.dll', '-r:System.Drawing.dll', path.join(here, 'tray.cs')], { encoding: 'utf8' })
+  assert.equal(build.status, 0, build.stdout + build.stderr)
+  const live = (stage, completed, total) => ({ stage, text: `${completed}/${total}`, live: true, completed, total })
+  const left = (remainingCount) => ({ stage: 'sessions', text: 'Remaining sessions', live: true, sessionTotal: 4, remainingCount })
+  const replay = async (rows) => {
+    await writeFile(events, rows.map(row => JSON.stringify(row)).join('\n') + '\n')
+    const result = spawnSync(exe, ['--progress', events], { encoding: 'utf8' })
+    assert.equal(result.status, 0, result.stderr)
+    return result.stdout.split('\n').map(line => { const [percent, detail, step] = line.split(' | '); return { percent: Number(percent), detail, step } })
+  }
+  const moved = await replay([live('scan', 0, 4), live('scan', 4, 4), left(4), live('move', 2, 4), left(2), live('move', 4, 4), left(0), live('verify', 4, 4), live('retire', 4, 4), live('scan', 1, 4),
+    { done: true, ok: true, summary: { moved: 4 } }])
+  assert.equal(moved.length, 11)
+  assert.ok(moved.every((row, index) => index === 0 || row.percent >= moved[index - 1].percent), moved.map(row => row.percent).join(' '))
+  assert.ok(moved.slice(0, -1).every(row => row.percent < 100))
+  assert.ok(moved[4].percent > 0)
+  assert.equal(moved[4].detail, `${moved[4].percent}% · 2 sessions left`)
+  assert.equal(moved[3].step, 'Moving sessions 2/4')
+  assert.equal(moved[7].step, 'Verifying history 4/4')
+  assert.equal(moved[9].step, moved[8].step)
+  assert.deepEqual(moved.at(-1), { percent: 100, detail: '4 sessions moved', step: 'Done' })
+  const restarted = await replay([live('scan', 4, 4), { stage: 'desktop', text: 'Closing Claude Desktop', live: true }, live('move', 1, 1), { stage: 'reopen', text: 'Opening Claude Desktop', live: true },
+    { error: 'Claude Desktop did not reopen' }])
+  assert.equal(restarted[1].step, 'Closing Claude Desktop')
+  assert.equal(restarted[3].step, 'Opening Claude Desktop')
+  assert.ok(restarted[3].percent > restarted[1].percent)
+  assert.deepEqual(restarted.at(-1), { percent: restarted[3].percent, detail: 'Claude Desktop did not reopen', step: 'Stopped' })
 })
 
 test('regular sidecar hashes and fingerprints retain the existing receipt format', async () => {
