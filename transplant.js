@@ -5217,7 +5217,53 @@ const compileMenubar = (source, binary) => {
   if (build.status !== 0) throw new Error(`swiftc failed\n${build.stderr.trim()}`)
 }
 
+const windowsSystem = (...parts) => path.win32.join(process.env.SystemRoot ?? 'C:\\Windows', ...parts)
+
+async function windowsTray(paths, remove, snapshot) {
+  if (snapshot) throw new Error('menubar --snapshot renders the macOS panel only')
+  const tray = path.join(paths.state, 'tray')
+  const binary = path.join(tray, 'Claude Transplant.exe')
+  const shortcut = path.join(paths.home, 'AppData/Roaming/Microsoft/Windows/Start Menu/Programs/Startup/Claude Transplant.lnk')
+  const stop = () => spawnSync(windowsSystem('System32', 'taskkill.exe'), ['/F', '/IM', 'Claude Transplant.exe'], { stdio: 'ignore', windowsHide: true })
+  if (remove) {
+    stop()
+    await rm(tray, { recursive: true, force: true })
+    await rm(shortcut, { force: true })
+    return 'tray removed'
+  }
+  const source = path.join(HERE, 'tray.cs')
+  const key = sha((await readFile(source, 'utf8')) + VERSION)
+  const built = path.join(tray, 'build.sha256')
+  const fresh = `${tray}.building`
+  const rebuild = (await readFile(built, 'utf8').catch(() => '')) !== key
+  if (rebuild) {
+    await rm(fresh, { recursive: true, force: true })
+    await mkdir(fresh, { recursive: true })
+    const build = spawnSync(windowsSystem('Microsoft.NET', 'Framework64', 'v4.0.30319', 'csc.exe'), ['-nologo', '-target:winexe', '-optimize',
+      `-out:${path.join(fresh, 'Claude Transplant.exe')}`, '-r:System.Web.Extensions.dll', '-r:System.Windows.Forms.dll', '-r:System.Drawing.dll', source], { encoding: 'utf8', windowsHide: true })
+    if (build.error) throw new Error('the .NET Framework 4 compiler (csc.exe) was not found')
+    if (build.status !== 0) throw new Error(`csc failed\n${(build.stdout + build.stderr).trim()}`)
+    await writeFile(path.join(fresh, 'build.sha256'), key)
+  }
+  stop()
+  if (rebuild) {
+    await rm(tray, { recursive: true, force: true })
+    await rename(fresh, tray)
+  }
+  const script = path.join(tray, 'transplant.js')
+  await copyFile(path.join(HERE, 'transplant.js'), script)
+  await writeFile(path.join(tray, 'package.json'), jsonText({ type: 'module', version: VERSION }))
+  await writeFile(path.join(tray, 'tray.json'), jsonText({ node: process.execPath, script, nodeArgs: [`--max-old-space-size=${menubarHeapMiB()}`] }))
+  await mkdir(path.dirname(shortcut), { recursive: true })
+  const quoted = (text) => `'${text.replaceAll("'", "''")}'`
+  const shortcutResult = spawnSync(windowsPowerShell(), ['-NoProfile', '-NonInteractive', '-Command', `$link = (New-Object -ComObject WScript.Shell).CreateShortcut(${quoted(shortcut)}); $link.TargetPath = ${quoted(binary)}; $link.WorkingDirectory = ${quoted(tray)}; $link.Save()`], { encoding: 'utf8', windowsHide: true })
+  if (shortcutResult.error || shortcutResult.status !== 0) throw new Error(`could not create the Startup shortcut: ${(shortcutResult.stderr || '').trim()}`)
+  spawn(binary, [], { detached: true, stdio: 'ignore', cwd: tray }).unref()
+  return `tray installed | starts at sign-in | ${tray}`
+}
+
 async function menubar(paths, remove, snapshot) {
+  if (process.platform === 'win32') return windowsTray(paths, remove, snapshot)
   const app = path.join(paths.state, 'Claude Transplant.app')
   const binary = path.join(app, 'Contents/MacOS/Claude Transplant')
   const agent = path.join(paths.home, 'Library/LaunchAgents', `${LABEL}.plist`)

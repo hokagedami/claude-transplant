@@ -16,7 +16,7 @@ const here = path.dirname(fileURLToPath(import.meta.url))
 const fixtureCommand = run => (file, ...args) => {
   if (file === '/usr/bin/security') return { status: 1, stdout: '', stderr: 'fixture login unavailable' }
   if (/Win32_Process/.test(args[0]?.at?.(-1) ?? '')) return { status: 0, stdout: '[]', stderr: '' }
-  if (['/usr/bin/osascript', '/usr/bin/open', '/bin/launchctl', 'launchctl', 'pkill'].includes(file)) throw new Error('fixture native command requires a mock')
+  if (['/usr/bin/osascript', '/usr/bin/open', '/bin/launchctl', 'launchctl', 'pkill'].includes(file) || /(taskkill\.exe|Claude Transplant\.exe)$/i.test(file)) throw new Error('fixture native command requires a mock')
   return run(file, ...args)
 }
 childProcess.spawnSync = fixtureCommand(childProcess.spawnSync)
@@ -11735,6 +11735,75 @@ test('synthetic menubar installation reports the package version without invokin
     assert.equal(stdout.trim(), JSON.parse(await readFile(path.join(here, 'package.json'))).version)
     assert.deepEqual(JSON.parse(await readFile(path.join(h.paths.state, 'menubar.json'))).nodeArgs, [`--max-old-space-size=${menubarHeapMiB()}`])
   }
+})
+
+test('Windows tray installation builds once, starts at sign-in and removes cleanly', { skip: process.platform !== 'win32' }, async () => {
+  const h = await home(), log = path.join(h.root, 'native-calls.jsonl')
+  const startup = path.join(h.root, 'AppData', 'Roaming', 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', 'Claude Transplant.lnk')
+  const setup = `
+    import { appendFileSync, writeFileSync, mkdirSync } from 'node:fs'
+    import nodePath from 'node:path'
+    const record = (name, detail) => appendFileSync(${JSON.stringify(log)}, JSON.stringify({ name, detail }) + '\\n')
+    const syntheticSpawn = childProcess.spawnSync, syntheticAsync = childProcess.spawn
+    childProcess.spawnSync = (file, args, ...rest) => {
+      if (/csc\\.exe$/i.test(file)) {
+        const out = args.find(arg => arg.startsWith('-out:')).slice(5)
+        writeFileSync(out, 'synthetic tray')
+        record('csc', args.at(-1))
+        return { status: 0, stdout: '', stderr: '' }
+      }
+      if (/taskkill\\.exe$/i.test(file)) { record('taskkill', args); return { status: 0, stdout: '', stderr: '' } }
+      if (/powershell\\.exe$/i.test(file) && /WScript\\.Shell/.test(args.at(-1))) {
+        mkdirSync(nodePath.dirname(${JSON.stringify(startup)}), { recursive: true })
+        writeFileSync(${JSON.stringify(startup)}, 'synthetic shortcut')
+        record('shortcut', args.at(-1))
+        return { status: 0, stdout: '', stderr: '' }
+      }
+      return syntheticSpawn(file, args, ...rest)
+    }
+    childProcess.spawn = (file, args, ...rest) => {
+      if (/Claude Transplant\\.exe$/i.test(file)) { record('start', file); return { unref: () => {}, on: () => {}, once: () => {} } }
+      return syntheticAsync(file, args, ...rest)
+    }
+  `
+  const tray = path.join(h.paths.state, 'tray')
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const result = await cli(h.root, ['menubar'], setup)
+    assert.equal(result.code, 0, result.stderr)
+    assert.match(result.stdout, /tray installed/)
+    const { stdout } = await promisify(execFile)(process.execPath, [path.join(tray, 'transplant.js'), '--version'], { env: { ...process.env, HOME: h.root, USERPROFILE: h.root } })
+    assert.equal(stdout.trim(), JSON.parse(await readFile(path.join(here, 'package.json'))).version)
+    const config = JSON.parse(await readFile(path.join(tray, 'tray.json')))
+    assert.deepEqual(config, { node: process.execPath, script: path.join(tray, 'transplant.js'), nodeArgs: [`--max-old-space-size=${menubarHeapMiB()}`] })
+  }
+  const calls = lines(await readFile(log, 'utf8'))
+  assert.deepEqual(calls.map(call => call.name), ['csc', 'taskkill', 'shortcut', 'start', 'taskkill', 'shortcut', 'start'])
+  assert.equal(await readFile(path.join(tray, 'Claude Transplant.exe'), 'utf8'), 'synthetic tray')
+  assert.ok(calls.filter(call => call.name === 'shortcut').every(call => call.detail.includes(path.join(tray, 'Claude Transplant.exe'))))
+  const removed = await cli(h.root, ['menubar', '--remove'], setup)
+  assert.equal(removed.code, 0, removed.stderr)
+  assert.match(removed.stdout, /tray removed/)
+  assert.equal(await stat(tray).catch(() => null), null)
+  assert.equal(await stat(startup).catch(() => null), null)
+  assert.equal(lines(await readFile(log, 'utf8')).at(-1).name, 'taskkill')
+  const snapshot = await cli(h.root, ['menubar', '--snapshot', path.join(h.root, 'panel.png')], setup)
+  assert.notEqual(snapshot.code, 0)
+  assert.match(snapshot.stderr + snapshot.stdout, /snapshot.*macOS/)
+})
+
+test('the Windows tray compiles and describes accounts, sessions and waiting work', { skip: process.platform !== 'win32' }, async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'transplant-tray-')), exe = path.join(dir, 'tray.exe'), sample = path.join(dir, 'accounts.json')
+  const build = spawnSync(path.win32.join(process.env.SystemRoot, 'Microsoft.NET', 'Framework64', 'v4.0.30319', 'csc.exe'),
+    ['-nologo', '-target:winexe', `-out:${exe}`, '-r:System.Web.Extensions.dll', '-r:System.Windows.Forms.dll', '-r:System.Drawing.dll', path.join(here, 'tray.cs')], { encoding: 'utf8' })
+  assert.equal(build.status, 0, build.stdout + build.stderr)
+  await writeFile(sample, JSON.stringify([{ account: 'a', org: 'o', label: 'p@example.com · Personal', sessions: 37, active: true, signedIn: true },
+    { account: 'b', org: 'q', label: 't@example.com · Team', sessions: 1, pending: 'local', pendingAction: 'restart' }, { account: 'c', org: 'r', label: 'u@example.com', pending: 'undo', pendingAction: 'sign-in' }]))
+  const described = spawnSync(exe, ['--describe', sample], { encoding: 'utf8' })
+  assert.equal(described.status, 0, described.stderr)
+  assert.deepEqual(described.stdout.split('\n'), ['p@example.com · Personal · 37 sessions · signed in', 't@example.com · Team · 1 session', '  move waiting, Finish restarts Claude',
+    'u@example.com', '  Undo waiting, sign Claude into this account'])
+  await writeFile(sample, '[]')
+  assert.equal(spawnSync(exe, ['--describe', sample], { encoding: 'utf8' }).stdout, 'No Claude Desktop accounts found')
 })
 
 test('regular sidecar hashes and fingerprints retain the existing receipt format', async () => {
