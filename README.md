@@ -92,7 +92,7 @@ Prefer the terminal? `npx github:hokagedami/claude-transplant` opens the same pi
 npx github:hokagedami/claude-transplant menubar --remove
 ```
 
-This removes the tray and its Startup shortcut. Receipts and quarantine stay in `%APPDATA%\claude-transplant`. Delete that folder only when you no longer need `undo`.
+This removes the tray and its Startup shortcut. Receipts and quarantine stay in the tool's folder, `claude-transplant` beside Desktop's data (see [What each command touches](#what-each-command-touches)). Delete that folder only when you no longer need `undo`.
 
 **If something goes wrong:**
 
@@ -124,7 +124,7 @@ The Windows counterpart of the menubar, a small tray app with the same moves.
 - Starts at login through the Startup shortcut. Turn that off in Settings › Apps › Startup, or with `menubar --remove`.
 - Quit while a move runs asks first. The move continues and `finish` picks it up later.
 - Bundles its own CLI, so rerun `menubar` after upgrading. The macOS panel's demo, snapshot and update notice are not part of the tray.
-- Files live in `%APPDATA%\claude-transplant\tray`. The CLI and receipts are shared with the tray, so either can undo the other's move.
+- Files live in the `tray` folder inside the tool's folder. The CLI and receipts are shared with the tray, so either can undo the other's move.
 
 ## CLI
 
@@ -161,7 +161,7 @@ To    ↑↓ move · enter confirm
 
 ## What each command touches
 
-Every command may write the tool's own folder, `~/Library/Application Support/claude-transplant` or `%APPDATA%\claude-transplant` on Windows: cache, lock, restart plan and diagnostics, receipts, quarantine and drift evidence. A move, `finish`, `sweep`, `undo` and `restart` first finish interrupted work, which can move records, rewrite the receipt and reopen Claude Desktop. `--dry-run` and `keep-local` refuse during recovery.
+Every command may write the tool's own folder, `~/Library/Application Support/claude-transplant` on macOS. On Windows it sits beside Desktop's data: `%LOCALAPPDATA%\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Roaming\claude-transplant` with the packaged (MSIX) Desktop, or `%APPDATA%\claude-transplant` when that package folder doesn't exist. It holds cache, lock, restart plan and diagnostics, receipts, quarantine and drift evidence. A move, `finish`, `sweep`, `undo` and `restart` first finish interrupted work, which can move records, rewrite the receipt and reopen Claude Desktop. `--dry-run` and `keep-local` refuse during recovery.
 
 | Command | Beyond the tool's own folder |
 |---|---|
@@ -181,7 +181,7 @@ Command and flag names are stable. Renames get a deprecation release first.
 
 ### Why is the Code sidebar empty after switching accounts?
 
-Desktop keeps one record per session under `~/Library/Application Support/Claude/claude-code-sessions/<account>/<organization>`, or `%APPDATA%\Claude\claude-code-sessions\<account>\<organization>` on Windows, and lists only the signed-in folder. The transcripts in `~/.claude/projects`, `%USERPROFILE%\.claude\projects` on Windows, are shared by every account.
+Desktop keeps one record per session under `~/Library/Application Support/Claude/claude-code-sessions/<account>/<organization>`, or `claude-code-sessions\<account>\<organization>` in Desktop's data folder on Windows, and lists only the signed-in folder. The transcripts in `~/.claude/projects`, `%USERPROFILE%\.claude\projects` on Windows, are shared by every account.
 
 ### My sessions disappeared after signing out, an update, or a reset. Is this the fix?
 
@@ -225,7 +225,7 @@ Manual walkthrough: [recovering missing Claude Desktop history](https://dev.to/v
 
 ## How it works
 
-A session is three files: the transcript in `~/.claude/projects`, the sidecar directory beside it, and the record under `~/Library/Application Support/Claude/claude-code-sessions/<account>/<organization>` (`%APPDATA%\Claude\claude-code-sessions` on Windows). A move leaves the transcript and sidecars in place, writes and verifies the destination record with the same `cliSessionId`, then parks the source record in quarantine.
+A session is three files: the transcript in `~/.claude/projects`, the sidecar directory beside it, and the record under `~/Library/Application Support/Claude/claude-code-sessions/<account>/<organization>` (`claude-code-sessions` in Desktop's data folder on Windows). A move leaves the transcript and sidecars in place, writes and verifies the destination record with the same `cliSessionId`, then parks the source record in quarantine.
 
 Eligibility:
 
@@ -254,7 +254,7 @@ Remote Control (`--cloud`):
 
 Windows:
 
-- Records, config and cookies are under `%APPDATA%\Claude`. Desktop 4.4212.0 logs to `%LOCALAPPDATA%\Claude\Logs` with CRLF line endings. The older `%APPDATA%\Claude\logs` stops at the version that moved them.
+- Desktop's data folder holds records, config and cookies. The packaged Desktop, MSIX `Claude_pzs8sxrjxfjjc` 4.16336.0 on both machines checked, runs with MSIX file virtualization, so its writes to `%APPDATA%\Claude` land in `%LOCALAPPDATA%\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Roaming\Claude`. Processes outside the package see only the real `%APPDATA%\Claude`, which is missing or stale, while Claude Code inside Desktop sees both merged. The tool uses the package folder whenever it exists, so the CLI, the tray at sign-in and Claude Code inside Desktop all read and write the same files. Without the package folder it uses `%APPDATA%\Claude`. Desktop exempts its logs from virtualization, and 4.4212.0 logs to `%LOCALAPPDATA%\Claude\Logs` with CRLF line endings. The older `%APPDATA%\Claude\logs` stops at the version that moved them.
 - Processes come from `Win32_Process`. Desktop's Electron helpers share its `claude.exe` and carry `--type=`, so they are neither Desktop nor workers. Code workers register as `win32:<host>` with a FILETIME start, matched to the millisecond.
 - Desktop quits through Restart Manager for its exact PID and start time, the request Desktop builds from August and September 2026 logged as "Windows session ending (close-app) - quitting the app". It is never killed. It reopens through its Store app id, or its `claude.exe` for other installs.
 - The kernel lock is an exclusive handle held by a PowerShell helper and released when it exits.
