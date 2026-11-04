@@ -119,7 +119,8 @@ The Windows counterpart of the menubar, a small tray app with the same moves.
 - `npx github:hokagedami/claude-transplant menubar` builds a tray app with `csc.exe`, adds a Startup shortcut and starts it. `menubar --remove` stops it and removes both.
 - The menu lists each account with its session count, the signed-in account, and work that is waiting. Move sessions… picks the destination and the accounts to take from, then moves with `--cloud`.
 - A move that needs Desktop closed asks first and names the open chats that will stop: Restart and move, Move the others only, or Cancel.
-- Finish, Keep local and Undo last move run the same CLI commands. Progress shows in the icon's tooltip and the result as a notification.
+- Finish, Keep local and Undo last move run the same CLI commands.
+- Each run opens a progress window with a bar, the percentage and sessions left, and the current step, such as Closing Claude Desktop or Moving sessions 12/37. The percentage is weighted like the macOS panel's, so the local move fills the first part and cloud cleanup the rest. Hide keeps it running in the background, Show progress in the menu brings it back, and it ends with the result and a Close button. The result also shows as a notification.
 - Left or right click the icon to open the menu: Move sessions…, Finish, Keep local, Undo last move, Refresh and Quit. Items that don't apply right now are greyed out.
 - Starts at login through the Startup shortcut. Turn that off in Settings › Apps › Startup, or with `menubar --remove`.
 - Quit while a move runs asks first. The move continues and `finish` picks it up later.
