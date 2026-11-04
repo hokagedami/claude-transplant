@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import childProcess, { execFile, spawn, spawnSync } from 'node:child_process'
-import { createHash, randomUUID } from 'node:crypto'
+import { createCipheriv, createHash, randomBytes, randomUUID } from 'node:crypto'
 import { once } from 'node:events'
 import fsSync, { appendFileSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import fs, { appendFile, lstat, mkdir, mkdtemp, open, readdir, readFile, readlink, rename, stat, symlink, unlink, writeFile } from 'node:fs/promises'
@@ -10,7 +10,7 @@ import path from 'node:path'
 import test from 'node:test'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { promisify } from 'node:util'
-import { accounts, cloudClient, conversation, conversationMatch, executeMove, finishHeld, finishPending, finishWorkflow, idleTimeouts, inventory, keepLocal, layout, memoryBudget, menubarHeapMiB, move, normalize, parseProcesses, parseWindowsProcesses, pendingPresentation, quitCommand, readReceipt, receiptSummary, restartPlan, semantic, signedIn, step, sweep, undo, verifyPlaced, windowsLockHelper, withDesktopRestart, writeNew } from './transplant.js'
+import { accounts, cloudClient, conversation, conversationMatch, executeMove, finishHeld, finishPending, finishWorkflow, idleTimeouts, inventory, keepLocal, layout, memoryBudget, menubarHeapMiB, move, normalize, parseProcesses, parseWindowsProcesses, pendingPresentation, quitCommand, windowsLogin, windowsUnprotect, windowsUserAgent, readReceipt, receiptSummary, restartPlan, semantic, signedIn, step, sweep, undo, verifyPlaced, windowsLockHelper, withDesktopRestart, writeNew } from './transplant.js'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const fixtureCommand = run => (file, ...args) => {
@@ -139,6 +139,93 @@ test('process identity separates Desktop descendants, external workers, and reus
   const alternate = parseProcesses(table.replaceAll('/Applications/Claude.app', '/Users/fixture/Applications/Claude.app'), commands)
   assert.equal(alternate.find((row) => row.pid === 11).worker, true)
   assert.equal(alternate.find((row) => row.pid === 12).desktopPid, 10)
+})
+
+async function windowsLoginFixture(h, cookies, { version = 24 } = {}) {
+  const { DatabaseSync } = await import('node:sqlite')
+  const key = randomBytes(32), wrapped = randomBytes(40)
+  const encrypt = (host, value) => {
+    const nonce = randomBytes(12), cipher = createCipheriv('aes-256-gcm', key, nonce)
+    const plain = Buffer.concat([version >= 24 ? createHash('sha256').update(host).digest() : Buffer.alloc(0), Buffer.from(value)])
+    const body = Buffer.concat([cipher.update(plain), cipher.final()])
+    return Buffer.concat([Buffer.from('v10'), nonce, body, cipher.getAuthTag()])
+  }
+  await mkdir(path.dirname(h.paths.cookies), { recursive: true })
+  await writeFile(h.paths.localState, JSON.stringify({ os_crypt: { encrypted_key: Buffer.concat([Buffer.from('DPAPI'), wrapped]).toString('base64') } }))
+  const db = new DatabaseSync(h.paths.cookies)
+  db.exec("CREATE TABLE meta (key TEXT, value TEXT); CREATE TABLE cookies (host_key TEXT, name TEXT, value TEXT, encrypted_value BLOB, path TEXT DEFAULT '/', creation_utc INTEGER DEFAULT 0)")
+  db.prepare('INSERT INTO meta VALUES (?, ?)').run('version', String(version))
+  const insert = db.prepare('INSERT INTO cookies (host_key, name, value, encrypted_value) VALUES (?, ?, ?, ?)')
+  for (const [host, name, value, plain] of cookies) insert.run(host, name, plain ? value : '', plain ? Buffer.alloc(0) : encrypt(host, value))
+  db.close()
+  return { unprotect: blob => { assert.deepEqual(blob, wrapped); return key }, encrypt }
+}
+
+test('Windows Desktop login decrypts claude.ai cookies with the DPAPI key and verifies their host', async () => {
+  const h = await home()
+  const f = await windowsLoginFixture(h, [['.claude.ai', 'sessionKey', 'sk-fixture'], ['claude.ai', 'lastActiveOrg', h.org.P], ['.claude.ai', 'plain', 'kept', true],
+    ['.example.com', 'sessionKey', 'other-site'], ['.claude.ai', 'bad;name', 'skipped']])
+  const login = await windowsLogin(h.paths, f.unprotect)
+  assert.deepEqual([...login].sort(), [['lastActiveOrg', h.org.P], ['plain', 'kept'], ['sessionKey', 'sk-fixture']])
+  const legacy = await home()
+  const old = await windowsLoginFixture(legacy, [['.claude.ai', 'sessionKey', 'sk-legacy']], { version: 23 })
+  assert.equal((await windowsLogin(legacy.paths, old.unprotect)).get('sessionKey'), 'sk-legacy')
+  const moved = await home()
+  const swapped = await windowsLoginFixture(moved, [['.claude.ai', 'sessionKey', 'sk-moved']])
+  const { DatabaseSync } = await import('node:sqlite')
+  const db = new DatabaseSync(moved.paths.cookies)
+  db.prepare('UPDATE cookies SET encrypted_value = ?').run(swapped.encrypt('.example.com', 'sk-moved'))
+  db.close()
+  await assert.rejects(windowsLogin(moved.paths, swapped.unprotect), /host verification failed/)
+  const empty = await home()
+  const none = await windowsLoginFixture(empty, [['.claude.ai', 'lastActiveOrg', h.org.P]])
+  await assert.rejects(windowsLogin(empty.paths, none.unprotect), { code: 'CLOUD_AUTH_PENDING' })
+})
+
+test('a running Windows Desktop holding its cookie database leaves cloud work pending', { skip: process.platform !== 'win32' }, async () => {
+  const h = await home()
+  const f = await windowsLoginFixture(h, [['.claude.ai', 'sessionKey', 'sk-fixture']])
+  const guard = await hold(h.paths.cookies)
+  try {
+    await assert.rejects(windowsLogin(h.paths, f.unprotect), { code: 'CLOUD_AUTH_PENDING', message: /while it runs/ })
+  } finally {
+    const exited = once(guard, 'exit')
+    guard.stdin.end()
+    await exited
+  }
+  assert.equal((await windowsLogin(h.paths, f.unprotect)).get('sessionKey'), 'sk-fixture')
+})
+
+test('Windows cloud calls carry the login captured while Desktop was closed and the installed Desktop user agent', { skip: process.platform !== 'win32' }, async t => {
+  const h = await home(), install = path.join(h.root, 'install', 'app'), exe = path.join(install, 'claude.exe')
+  await mkdir(install, { recursive: true })
+  await writeFile(exe, Buffer.concat([randomBytes(64), Buffer.from('Mozilla/5.0 Chrome/152.0.7977.167 Safari'), randomBytes(64)]))
+  await writeFile(path.join(install, 'version'), '44.9.3\n')
+  assert.equal(await windowsUserAgent('shell:AppsFolder\\Claude_fixture!Claude', app => { assert.equal(app, 'shell:AppsFolder\\Claude_fixture!Claude'); return { exe, version: '4.4212.0' } }),
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Claude/4.4212.0 Chrome/152.0.7977.167 Electron/44.9.3 Safari/537.36')
+  await assert.rejects(windowsUserAgent('C:\\fixture\\claude.exe', () => ({ exe: path.join(h.root, 'missing.exe'), version: '1' })), /browser version/)
+  const store = 'C:\\Program Files\\WindowsApps\\Claude_4.4212.0.0_x64__pzs8sxrjxfjjc\\app\\claude.exe'
+  let rows = [{ ...desktopFixture()[0], executable: store, started: '2026-11-03T16:12:54.688Z' }]
+  const plan = await restartPlan(null, h.paths, rows)
+  await withDesktopRestart(plan, h.paths, async () => ({ ok: true }), () => {}, { inspect: () => rows, command: async () => {
+    rows = rows.length ? [] : [{ ...desktopFixture()[0], executable: store, pid: 700, started: '2026-11-03T16:20:00.000Z' }]
+    return { status: 0 }
+  }, captureLogin: async () => new Map([['sessionKey', 'sk-captured'], ['lastActiveOrg', h.org.P]]) })
+  const cookies = []
+  t.mock.method(globalThis, 'fetch', async (url, options) => {
+    cookies.push(options.headers.cookie)
+    return new URL(url).pathname === '/api/account' ? Response.json({ uuid: h.acct.P }) : Response.json([{ uuid: h.org.P }])
+  })
+  await cloudClient(h.paths, null, { active: { state: 'unknown' }, userAgent: 'fixture' })
+  assert.deepEqual(cookies, ['sessionKey=sk-captured; lastActiveOrg=' + h.org.P, 'sessionKey=sk-captured; lastActiveOrg=' + h.org.P])
+})
+
+test('Windows DPAPI unprotects a key protected for the current user', { skip: process.platform !== 'win32' }, () => {
+  const key = randomBytes(32), shell = windowsLockHelper('unused')[0]
+  const protectedKey = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', `Add-Type -AssemblyName System.Security; [Convert]::ToBase64String([System.Security.Cryptography.ProtectedData]::Protect([Convert]::FromBase64String('${key.toString('base64')}'), $null, 'CurrentUser'))`], { encoding: 'utf8' })
+  assert.equal(protectedKey.status, 0, protectedKey.stderr)
+  assert.deepEqual(windowsUnprotect(Buffer.from(protectedKey.stdout.trim(), 'base64')), key)
+  assert.throws(() => windowsUnprotect(randomBytes(40)), /cannot read Claude Desktop login/)
 })
 
 test('layout places Claude Desktop and transplant state per platform inside the given home', () => {
@@ -393,14 +480,23 @@ test('a Windows Desktop restart closes through Restart Manager and reopens its o
     const h = await home()
     const desktop = (pid, started) => ({ ...desktopFixture()[0], pid, desktopPid: pid, started, executable })
     let rows = [desktop(500, '2026-11-03T16:12:54.688Z'), { ...desktopFixture()[1], executable: 'C:\\Users\\fixture\\AppData\\Roaming\\Claude\\claude-code\\2.1.309\\x\\claude.exe' }]
-    const plan = await restartPlan(null, h.paths, rows), calls = []
+    const plan = await restartPlan(null, h.paths, rows), calls = [], order = []
     assert.equal(plan.app, app)
-    const result = await withDesktopRestart(plan, h.paths, async () => ({ ok: true }), () => {}, { inspect: () => rows, command: async (file, args) => {
+    const result = await withDesktopRestart(plan, h.paths, async () => { order.push('work'); return { ok: true } }, () => {}, { inspect: () => rows, command: async (file, args) => {
       calls.push({ file, script: args.at(-1) })
+      order.push(calls.length === 1 ? 'quit' : 'open')
       rows = calls.length === 1 ? [] : [desktop(700, '2026-11-03T16:20:00.000Z')]
       return { status: 0 }
+    }, captureLogin: async (paths) => {
+      assert.equal(paths.cookies, h.paths.cookies)
+      assert.deepEqual(rows, [])
+      order.push('login')
+      return new Map([['sessionKey', 'sk-captured']])
     } })
+    assert.deepEqual(order, ['quit', 'login', 'work', 'open'])
     assert.equal(result.restart.outcome, 'reopened')
+    assert.equal(JSON.stringify(result.restart).includes('sk-captured'), false)
+    assert.equal((await readFile(path.join(h.paths.state, 'restart.json'), 'utf8')).includes('sk-captured'), false)
     assert.ok(calls.every(call => /powershell\.exe$/i.test(call.file)))
     assert.match(calls[0].script, /RmShutdown/)
     assert.match(calls[0].script, /-Id 500\b/)
@@ -459,7 +555,7 @@ test('a failed progress callback cannot prevent the mandatory reopen', async () 
     calls.push(file)
     rows = file.endsWith('osascript') ? [] : [{ ...desktopFixture()[0], pid: 700, desktopPid: 700, started: 'new' }]
     return { status: 0 }
-  } })
+  }, captureLogin: () => assert.fail('macOS reads its login live') })
   assert.deepEqual(calls, ['/usr/bin/osascript', '/usr/bin/open'])
   assert.equal(reportedAfterOpen, true)
   assert.equal(result.restart.outcome, 'reopened')

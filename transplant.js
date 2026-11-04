@@ -574,6 +574,7 @@ export async function withDesktopRestart(plan, paths, work, report = () => {}, i
       state.outcome = 'moving'
       await save()
       await diagnostic('exited')
+      if (windowsApp(paths.claudeApp)) capturedLogin = await (io.captureLogin ?? windowsLogin)(paths).catch(() => null)
       check(true)
       result = await localActivity.run(activity, () => work({ at: state.at, restart: state, check, progress: activity.progress }))
     }
@@ -1115,7 +1116,25 @@ async function binaryMatch(file, pattern) {
   return null
 }
 
+const windowsExecutable = (app) => {
+  const family = app.match(/^shell:AppsFolder\\([^!]+)!/)?.[1]
+  const locate = family ? `$exe = Join-Path (Get-AppxPackage | Where-Object PackageFamilyName -eq '${family.replaceAll("'", "''")}').InstallLocation 'app\\claude.exe'` : `$exe = '${app.replaceAll("'", "''")}'`
+  const [shell, args] = powerShell(`$ErrorActionPreference = 'Stop'; ${locate}; @{ exe = $exe; version = (Get-Item $exe).VersionInfo.ProductVersion } | ConvertTo-Json -Compress`)
+  const result = spawnSync(shell, args, { encoding: 'utf8', timeout: 20_000, windowsHide: true })
+  if (result.error || result.status !== 0) throw new Error('cannot locate Claude Desktop')
+  return JSON.parse(result.stdout)
+}
+
+export async function windowsUserAgent(app, describe = windowsExecutable) {
+  const { exe, version } = describe(app)
+  const electron = (await readFile(path.join(path.dirname(exe), 'version'), 'utf8').catch(() => '')).trim()
+  const chrome = await binaryMatch(exe, /Chrome\/(\d+\.\d+\.\d+\.\d+)/).catch(() => null)
+  if (!chrome || !/^\d+\.\d+\.\d+$/.test(electron) || !/^\d+(\.\d+)*$/.test(version ?? '')) throw new Error('cannot determine Claude Desktop browser version')
+  return `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Claude/${version} Chrome/${chrome} Electron/${electron} Safari/537.36`
+}
+
 async function desktopUserAgent(paths) {
+  if (windowsApp(paths.claudeApp)) return windowsUserAgent(paths.claudeApp)
   const appInfo = path.join(paths.claudeApp, 'Contents/Info.plist')
   const framework = path.join(paths.claudeApp, 'Contents/Frameworks/Electron Framework.framework/Versions/A')
   const claude = plistValue(appInfo, 'CFBundleShortVersionString')
@@ -1125,35 +1144,75 @@ async function desktopUserAgent(paths) {
   return `Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Claude/${claude} Chrome/${chrome} Electron/${electron} Safari/537.36`
 }
 
-function decryptCookie(host, encrypted, key, version) {
-  if (!encrypted.length || !['v10', 'v11'].includes(encrypted.subarray(0, 3).toString())) throw new Error('unsupported Claude cookie encryption')
-  const decipher = createDecipheriv('aes-128-cbc', key, Buffer.alloc(16, 0x20))
-  const plain = Buffer.concat([decipher.update(encrypted.subarray(3)), decipher.final()])
+const cookieQuery = "SELECT host_key,name,hex(CAST(value AS BLOB)),hex(encrypted_value) FROM cookies WHERE host_key IN ('.claude.ai','claude.ai') ORDER BY length(path) DESC,creation_utc;"
+
+function cookieText(host, plain, version) {
   if (version < 24) return plain.toString('utf8')
   const digest = createHash('sha256').update(host).digest()
   if (!plain.subarray(0, digest.length).equals(digest)) throw new Error('Claude cookie host verification failed')
   return plain.subarray(digest.length).toString('utf8')
 }
 
-function desktopCookies(paths) {
-  const options = { encoding: 'utf8', maxBuffer: 2 * 1024 * 1024, timeout: 10_000 }
-  const versionResult = spawnSync('/usr/bin/sqlite3', ['-readonly', paths.cookies, "SELECT value FROM meta WHERE key='version';"], options)
-  const rowsResult = spawnSync('/usr/bin/sqlite3', ['-readonly', '-separator', '\t', paths.cookies, "SELECT host_key,name,hex(CAST(value AS BLOB)),hex(encrypted_value) FROM cookies WHERE host_key IN ('.claude.ai','claude.ai') ORDER BY length(path) DESC,creation_utc;"], options)
-  const secretResult = spawnSync('/usr/bin/security', ['find-generic-password', '-w', '-s', 'Claude Safe Storage'], options)
-  if ([versionResult, rowsResult, secretResult].some((result) => result.error || result.status !== 0)) throw new Error('cannot read Claude Desktop login')
-  const version = Number(versionResult.stdout.trim())
-  const password = secretResult.stdout.trimEnd()
-  const key = pbkdf2Sync(password, 'saltysalt', 1003, 16, 'sha1')
+function decryptCookie(host, encrypted, key, version) {
+  if (!encrypted.length || !['v10', 'v11'].includes(encrypted.subarray(0, 3).toString())) throw new Error('unsupported Claude cookie encryption')
+  const decipher = createDecipheriv('aes-128-cbc', key, Buffer.alloc(16, 0x20))
+  return cookieText(host, Buffer.concat([decipher.update(encrypted.subarray(3)), decipher.final()]), version)
+}
+
+function decryptWindowsCookie(host, encrypted, key, version) {
+  if (encrypted.length < 31 || encrypted.subarray(0, 3).toString() !== 'v10') throw new Error('unsupported Claude cookie encryption')
+  const decipher = createDecipheriv('aes-256-gcm', key, encrypted.subarray(3, 15))
+  decipher.setAuthTag(encrypted.subarray(-16))
+  return cookieText(host, Buffer.concat([decipher.update(encrypted.subarray(15, -16)), decipher.final()]), version)
+}
+
+function loginCookies(rows, decrypt) {
   const values = new Map()
-  for (const line of rowsResult.stdout.split('\n').filter(Boolean)) {
-    const [host, name, plainHex, encryptedHex] = line.split('\t')
+  for (const [host, name, plainHex, encryptedHex] of rows) {
     if (!/^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/.test(name ?? '')) continue
-    const value = plainHex ? Buffer.from(plainHex, 'hex').toString('utf8') : decryptCookie(host, Buffer.from(encryptedHex, 'hex'), key, version)
+    const value = plainHex ? Buffer.from(plainHex, 'hex').toString('utf8') : decrypt(host, Buffer.from(encryptedHex, 'hex'))
     if (value && !/[;\r\n]/.test(value)) values.set(name, value)
   }
   if (!values.has('sessionKey')) throw Object.assign(new Error('Claude Desktop login is still updating'), { code: 'CLOUD_AUTH_PENDING' })
   return values
 }
+
+function macCookies(paths) {
+  const options = { encoding: 'utf8', maxBuffer: 2 * 1024 * 1024, timeout: 10_000 }
+  const versionResult = spawnSync('/usr/bin/sqlite3', ['-readonly', paths.cookies, "SELECT value FROM meta WHERE key='version';"], options)
+  const rowsResult = spawnSync('/usr/bin/sqlite3', ['-readonly', '-separator', '\t', paths.cookies, cookieQuery], options)
+  const secretResult = spawnSync('/usr/bin/security', ['find-generic-password', '-w', '-s', 'Claude Safe Storage'], options)
+  if ([versionResult, rowsResult, secretResult].some((result) => result.error || result.status !== 0)) throw new Error('cannot read Claude Desktop login')
+  const version = Number(versionResult.stdout.trim())
+  const key = pbkdf2Sync(secretResult.stdout.trimEnd(), 'saltysalt', 1003, 16, 'sha1')
+  return loginCookies(rowsResult.stdout.split('\n').filter(Boolean).map(line => line.split('\t')), (host, encrypted) => decryptCookie(host, encrypted, key, version))
+}
+
+export function windowsUnprotect(blob) {
+  const result = spawnSync(windowsPowerShell(), ['-NoProfile', '-NonInteractive', '-Command', "Add-Type -AssemblyName System.Security; [Convert]::ToBase64String([System.Security.Cryptography.ProtectedData]::Unprotect([Convert]::FromBase64String([Console]::In.ReadToEnd().Trim()), $null, 'CurrentUser'))"],
+    { input: blob.toString('base64'), encoding: 'utf8', timeout: 20_000, windowsHide: true })
+  if (result.error || result.status !== 0 || !result.stdout.trim()) throw new Error('cannot read Claude Desktop login')
+  return Buffer.from(result.stdout.trim(), 'base64')
+}
+
+export async function windowsLogin(paths, unprotect = windowsUnprotect) {
+  const wrapped = Buffer.from((await readJson(paths.localState).catch(() => null))?.os_crypt?.encrypted_key ?? '', 'base64')
+  if (wrapped.subarray(0, 5).toString() !== 'DPAPI' || !(await exists(paths.cookies))) throw new Error('cannot read Claude Desktop login')
+  const { DatabaseSync } = await import('node:sqlite')
+  let db, version, rows
+  try {
+    db = new DatabaseSync(paths.cookies, { readOnly: true })
+    version = Number(db.prepare("SELECT value FROM meta WHERE key='version'").get()?.value)
+    rows = db.prepare(cookieQuery).all().map(Object.values)
+  } catch {
+    throw Object.assign(new Error('Claude Desktop holds its login while it runs. Cloud work continues after Desktop restarts.'), { code: 'CLOUD_AUTH_PENDING' })
+  } finally { db?.close() }
+  const key = unprotect(wrapped.subarray(5))
+  return loginCookies(rows, (host, encrypted) => decryptWindowsCookie(host, encrypted, key, version))
+}
+
+let capturedLogin = null
+const desktopCookies = (paths) => process.platform === 'win32' ? capturedLogin ?? windowsLogin(paths) : macCookies(paths)
 
 const wireRemoteId = (id) => {
   if (!/^(?:cse|session)_[A-Za-z0-9_-]+$/.test(id ?? '')) throw new Error('invalid Remote Control session id')
@@ -1170,7 +1229,7 @@ export async function cloudClient(paths, expected = null, io = {}) {
   if (current.state === 'logged-out') throw new Error('Claude Desktop is signed out')
   if (expected && current.state === 'known' && !sameLogin(expected, current)) throw new Error(`sign Claude Desktop into ${loginLabel(expected)}`)
   const selected = expected ?? (current.state === 'known' ? current : null)
-  const cookies = io.cookies ?? desktopCookies(paths)
+  const cookies = io.cookies ?? await desktopCookies(paths)
   const cookie = [...cookies].map(([name, value]) => `${name}=${value}`).join('; ')
   const userAgent = io.userAgent ?? await desktopUserAgent(paths)
   const baseHeaders = {
