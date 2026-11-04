@@ -21,7 +21,9 @@ Different accounts, the same conversations
 npx claude-transplant menubar
 ```
 
-Open the panel from the menu bar, check the accounts to take from, pick the one to land in, click Move. Sign Claude Desktop into that account and the sessions are listed there. On Windows the same command installs a tray icon, and Move sessions… opens the same choice.
+On macOS, open the panel from the menu bar, check the accounts to take from, pick the one to land in, click Move. Sign Claude Desktop into that account and the sessions are listed there.
+
+On Windows, run the same command in PowerShell or Command Prompt. It installs a tray icon next to the clock, which may sit under the ^ overflow arrow. Click it, choose Move sessions…, pick the account to land in and the accounts to take from, then sign Claude Desktop into that account. See [Windows tray](#windows-tray).
 
 ## What it does
 
@@ -43,10 +45,10 @@ Where it fits next to the other tools people find for this problem:
 
 ## Install
 
-Node 22 or newer, 22.13 or newer for `--cloud` on Windows. The menubar also needs the Xcode command line tools: `xcode-select --install`. The Windows tray is built with the .NET Framework 4 compiler that ships with Windows 10 and 11.
+Node 22 or newer, 22.13 or newer for `--cloud` on Windows. On macOS the menubar also needs the Xcode command line tools: `xcode-select --install`. On Windows nothing else is needed: the tray is built with the .NET Framework 4 compiler that ships with Windows 10 and 11, and Claude Desktop from the Microsoft Store or its installer both work.
 
 ```
-npx claude-transplant menubar   # install the menubar app
+npx claude-transplant menubar   # install the menubar app, or the tray on Windows
 npx claude-transplant           # CLI
 npm i -g claude-transplant      # global install, then claude-transplant
 ```
@@ -65,11 +67,17 @@ From this repo instead of npm: `npx github:vitaliyhayda/claude-transplant` (appe
 
 ## Windows tray
 
+The Windows counterpart of the menubar, a small tray app with the same moves.
+
 - `npx claude-transplant menubar` builds a tray app with `csc.exe`, adds a Startup shortcut and starts it. `menubar --remove` stops it and removes both.
 - The menu lists each account with its session count, the signed-in account, and work that is waiting. Move sessions… picks the destination and the accounts to take from, then moves with `--cloud`.
 - A move that needs Desktop closed asks first and names the open chats that will stop: Restart and move, Move the others only, or Cancel.
 - Finish, Keep local and Undo last move run the same CLI commands. Progress shows in the icon's tooltip and the result as a notification.
+- Left or right click the icon to open the menu: Move sessions…, Finish, Keep local, Undo last move, Refresh and Quit. Items that don't apply right now are greyed out.
+- Starts at login through the Startup shortcut. Turn that off in Settings › Apps › Startup, or with `menubar --remove`.
+- Quit while a move runs asks first. The move continues and `finish` picks it up later.
 - Bundles its own CLI, so rerun `menubar` after upgrading. The macOS panel's demo, snapshot and update notice are not part of the tray.
+- Files live in `%APPDATA%\claude-transplant\tray`. The CLI and receipts are shared with the tray, so either can undo the other's move.
 
 ## CLI
 
@@ -97,7 +105,7 @@ To    ↑↓ move · enter confirm
 | `--dry-run` | plan only, write nothing |
 | `undo` | restore the last move, refused if a moved session changed or is still open, a new fork needs its parent, or a source can't be restored |
 | `accounts` | list accounts |
-| `menubar` | install the menubar app, `--snapshot <png>` renders the live panel, `--remove` uninstalls |
+| `menubar` | install the menubar app, or the tray app on Windows, `--snapshot <png>` renders the live panel on macOS, `--remove` uninstalls |
 | `--from <match> --to <match>` | skip the picker, repeat `--from`, match on email, org name, or uuid prefix |
 | `--cloud` | reconcile the active source's Remote Control copies, queue the rest |
 | `--json` | one event per line |
@@ -106,7 +114,7 @@ To    ↑↓ move · enter confirm
 
 ## What each command touches
 
-Every command may write the tool's own folder, `~/Library/Application Support/claude-transplant` or `%APPDATA%claude-transplant` on Windows: cache, lock, restart plan and diagnostics, receipts, quarantine and drift evidence. A move, `finish`, `sweep`, `undo` and `restart` first finish interrupted work, which can move records, rewrite the receipt and reopen Claude Desktop. `--dry-run` and `keep-local` refuse during recovery.
+Every command may write the tool's own folder, `~/Library/Application Support/claude-transplant` or `%APPDATA%\claude-transplant` on Windows: cache, lock, restart plan and diagnostics, receipts, quarantine and drift evidence. A move, `finish`, `sweep`, `undo` and `restart` first finish interrupted work, which can move records, rewrite the receipt and reopen Claude Desktop. `--dry-run` and `keep-local` refuse during recovery.
 
 | Command | Beyond the tool's own folder |
 |---|---|
@@ -126,7 +134,7 @@ Command and flag names are stable. Renames get a deprecation release first.
 
 ### Why is the Code sidebar empty after switching accounts?
 
-Desktop keeps one record per session under `~/Library/Application Support/Claude/claude-code-sessions/<account>/<organization>` and lists only the signed-in folder. The transcripts in `~/.claude/projects` are shared by every account.
+Desktop keeps one record per session under `~/Library/Application Support/Claude/claude-code-sessions/<account>/<organization>`, or `%APPDATA%\Claude\claude-code-sessions\<account>\<organization>` on Windows, and lists only the signed-in folder. The transcripts in `~/.claude/projects`, `%USERPROFILE%\.claude\projects` on Windows, are shared by every account.
 
 ### My sessions disappeared after signing out, an update, or a reset. Is this the fix?
 
@@ -152,7 +160,7 @@ Shorter answers:
 
 - Does a move use tokens or talk to a model? No. Continuing a moved session costs the same as resuming any session after a break, because the prompt cache is per organization and a switch misses it either way.
 - Which plans and accounts work? Any plan that runs Claude Code in Claude Desktop, Pro, Max, Team, or Enterprise. Two organizations on one email, a Team seat next to a personal plan, are two sidebars and both are supported.
-- Is anything uploaded or read from Keychain? Only with `--cloud`, which the menubar's Move always passes. Desktop's claude.ai session is then read from Keychain in memory, sent only to claude.ai to reconcile Remote Control copies, and never stored.
+- Is anything uploaded or read from Keychain? Only with `--cloud`, which the menubar's and the tray's Move always pass. Desktop's claude.ai session is then read in memory, from Keychain on macOS or from Desktop's DPAPI-protected cookie store on Windows, sent only to claude.ai to reconcile Remote Control copies, and never stored.
 - Does the CLI or the VS Code extension have this problem? The CLI does not, `claude --resume` reads the shared transcripts regardless of login. The VS Code extension keeps its own session index, untested and not handled here.
 - What about Claude chats and Projects? Those live on claude.ai per organization and are not touched.
 - Can I do it by hand? For task-free sessions, quit Desktop, move the record file into the other account's organization folder, then reopen Desktop. Do it only while Desktop is closed, it rewrites records it has open from memory.
@@ -170,7 +178,7 @@ Manual walkthrough: [recovering missing Claude Desktop history](https://dev.to/v
 
 ## How it works
 
-A session is three files: the transcript in `~/.claude/projects`, the sidecar directory beside it, and the record under `~/Library/Application Support/Claude/claude-code-sessions/<account>/<organization>`. A move leaves the transcript and sidecars in place, writes and verifies the destination record with the same `cliSessionId`, then parks the source record in quarantine.
+A session is three files: the transcript in `~/.claude/projects`, the sidecar directory beside it, and the record under `~/Library/Application Support/Claude/claude-code-sessions/<account>/<organization>` (`%APPDATA%\Claude\claude-code-sessions` on Windows). A move leaves the transcript and sidecars in place, writes and verifies the destination record with the same `cliSessionId`, then parks the source record in quarantine.
 
 Eligibility:
 
@@ -194,16 +202,16 @@ Remote Control (`--cloud`):
 
 - Reads the selected source organizations under the signed-in login through Desktop's own claude.ai session. Cookies are decrypted in memory via Keychain, or on Windows with the DPAPI-protected key in `Local State`, sent only to `claude.ai`, and never stored.
 - A copy is matched to its local session by bridge link or title and proven against the local conversation, subagent messages and delivered queued prompts, matched by id, role, payload and order. It is archived only after its remote worker is disconnected and unchanged and the proof holds again on fresh files.
-- A copy that can't be proven to be on this Mac stays unarchived in its account, is named once in Details, and is never retried. The move still completes.
+- A copy that can't be proven to be on this computer stays unarchived in its account, is named once in Details, and is never retried. The move still completes.
 - Each retry checks identity, history and connection state before touching a remote row, and a failed source stays active and retryable.
 
 Windows:
 
-- Records, config and cookies are under `%APPDATA%Claude`. Desktop 4.4212.0 logs to `%LOCALAPPDATA%ClaudeLogs` with CRLF line endings. The older `%APPDATA%Claudelogs` stops at the version that moved them.
+- Records, config and cookies are under `%APPDATA%\Claude`. Desktop 4.4212.0 logs to `%LOCALAPPDATA%\Claude\Logs` with CRLF line endings. The older `%APPDATA%\Claude\logs` stops at the version that moved them.
 - Processes come from `Win32_Process`. Desktop's Electron helpers share its `claude.exe` and carry `--type=`, so they are neither Desktop nor workers. Code workers register as `win32:<host>` with a FILETIME start, matched to the millisecond.
 - Desktop quits through Restart Manager for its exact PID and start time, the request Desktop builds from August and September 2026 logged as "Windows session ending (close-app) - quitting the app". It is never killed. It reopens through its Store app id, or its `claude.exe` for other installs.
 - The kernel lock is an exclusive handle held by a PowerShell helper and released when it exits.
-- Dead ends: Desktop opens `NetworkCookies` exclusively, so it can't be read while Desktop runs, and the login is read into memory right after Desktop exits during a restart. `O_NOFOLLOW` does not exist, so link swaps are caught by the file identity checks instead. Windows refuses `fsync` on directories and read-only handles, so only the written handle is synced. Desktop does not log its user agent, so the Windows one follows the macOS format from the installed `claude.exe` and is unverified against real traffic.
+- Dead ends: Desktop opens `Network\Cookies` exclusively, so it can't be read while Desktop runs, and the login is read into memory right after Desktop exits during a restart. `O_NOFOLLOW` does not exist, so link swaps are caught by the file identity checks instead. Windows refuses `fsync` on directories and read-only handles, so only the written handle is synced. Desktop does not log its user agent, so the Windows one follows the macOS format from the installed `claude.exe` and is unverified against real traffic.
 
 Safety:
 
@@ -229,12 +237,12 @@ Safety:
 - blocked: needs merging, has a collision or unresolved parent, has an incomplete task family, or is owned by an external CLI worker
 - retired: source records moved to quarantine after verification
 - cloud mirrors: active or paused Remote Control copies under the signed-in source
-- cloud blocked: not proven to be on this Mac, connected worker, changed history, or account mismatch
-- kept: Remote Control copies left unarchived in their account, not proven to be on this Mac or left by Leave old copies and move
+- cloud blocked: not proven to be on this computer, connected worker, changed history, or account mismatch
+- kept: Remote Control copies left unarchived in their account, not proven to be on this computer or left by Leave old copies and move
 - source cloud checks: sources whose cloud cleanup still waits, usually for another login
 - newer cloud sessions: created after Move, left for the next move
 
-Accounts are labeled from `~/.claude.json` and its backups, `~/.claude*` profile directories, `~/.claude-switch/accounts/*` and Desktop's agent-mode records. Personal-plan organizations show as Personal, and an account with no known email shows a uuid prefix.
+Accounts are labeled, with `~` meaning `%USERPROFILE%` on Windows, from `~/.claude.json` and its backups, `~/.claude*` profile directories, `~/.claude-switch/accounts/*` and Desktop's agent-mode records. Personal-plan organizations show as Personal, and an account with no known email shows a uuid prefix.
 
 The active badge comes from Desktop's own `main.log`, with no Keychain read or network request, and shows unknown after a logout or an unfinished switch.
 
@@ -290,7 +298,7 @@ The active badge comes from Desktop's own `main.log`, with no Keychain read or n
 - Moving history out of a Team organization is your organization's decision.
 - File layouts, log wording, and endpoints are undocumented and may change. Tested combinations are in the table below.
 
-| claude-transplant | macOS | Claude Desktop | Claude Code | Tested |
+| claude-transplant | OS | Claude Desktop | Claude Code | Tested |
 |---|---|---|---|---|
 | 4.2.0 | 27.0.1 | 4.4212.0 | 2.1.309 | 2026-10-30 |
 | 4.2.1, Windows | Windows 11 10.0.26300 | 4.4212.0 | 2.1.309 | 2026-11-04 |
