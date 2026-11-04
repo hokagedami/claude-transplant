@@ -2,7 +2,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { spawn, spawnSync } from 'node:child_process'
 import { createDecipheriv, createHash, pbkdf2Sync, randomUUID } from 'node:crypto'
-import { constants, createReadStream, readFileSync, readdirSync, realpathSync } from 'node:fs'
+import { constants, createReadStream, existsSync, readFileSync, readdirSync, realpathSync } from 'node:fs'
 import { copyFile, link, lstat, mkdir, mkdtemp, open, readdir, readFile as readBytes, readlink, realpath, rename, rm, rmdir, stat, unlink, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -624,9 +624,13 @@ export async function withDesktopRestart(plan, paths, work, report = () => {}, i
   return { result, restart: state, code: stopCode, error: failure?.message ?? state.error, ok: state.outcome === 'reopened' && !state.error && result?.ok !== false }
 }
 
+const storePackageRoaming = (home) => path.join(home, 'AppData/Local/Packages/Claude_pzs8sxrjxfjjc/LocalCache/Roaming')
+
 export function layout(home = os.homedir(), platform = process.platform) {
   const windows = platform === 'win32'
-  const support = windows ? path.join(home, 'AppData/Roaming') : path.join(home, 'Library/Application Support')
+  const storeRoaming = storePackageRoaming(home)
+  const support = !windows ? path.join(home, 'Library/Application Support')
+    : existsSync(path.join(storeRoaming, 'Claude')) ? storeRoaming : path.join(home, 'AppData/Roaming')
   return {
     home,
     records: path.join(support, 'Claude/claude-code-sessions'),
@@ -5222,11 +5226,14 @@ const windowsSystem = (...parts) => path.win32.join(process.env.SystemRoot ?? 'C
 async function windowsTray(paths, remove, snapshot) {
   if (snapshot) throw new Error('menubar --snapshot renders the macOS panel only')
   const tray = path.join(paths.state, 'tray')
+  const roamingTray = path.join(paths.home, 'AppData/Roaming/claude-transplant/tray')
+  const clearRoamingTray = () => roamingTray === tray ? null : rm(roamingTray, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
   const binary = path.join(tray, 'Claude Transplant.exe')
   const shortcut = path.join(paths.home, 'AppData/Roaming/Microsoft/Windows/Start Menu/Programs/Startup/Claude Transplant.lnk')
   const stop = () => spawnSync(windowsSystem('System32', 'taskkill.exe'), ['/F', '/IM', 'Claude Transplant.exe'], { stdio: 'ignore', windowsHide: true })
   if (remove) {
     stop()
+    await clearRoamingTray()
     await rm(tray, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
     await rm(shortcut, { force: true })
     return 'tray removed'
@@ -5246,6 +5253,7 @@ async function windowsTray(paths, remove, snapshot) {
     await writeFile(path.join(fresh, 'build.sha256'), key)
   }
   stop()
+  await clearRoamingTray()
   if (rebuild) {
     await rm(tray, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
     await rename(fresh, tray)

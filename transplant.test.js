@@ -241,6 +241,38 @@ test('layout places Claude Desktop and transplant state per platform inside the 
   assert.equal(windows.claudeApp, 'shell:AppsFolder\\Claude_pzs8sxrjxfjjc!Claude')
 })
 
+test('layout follows the Microsoft Store build of Claude Desktop into its package folder', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ct-store-'))
+  const roaming = path.join(root, 'AppData', 'Roaming')
+  const packaged = path.join(root, 'AppData', 'Local', 'Packages', 'Claude_pzs8sxrjxfjjc', 'LocalCache', 'Roaming')
+  await mkdir(path.join(roaming, 'Claude'), { recursive: true })
+  assert.equal(layout(root, 'win32').records, path.join(roaming, 'Claude', 'claude-code-sessions'))
+  assert.equal(layout(root, 'win32').state, path.join(roaming, 'claude-transplant'))
+  await mkdir(path.join(packaged, 'Claude'), { recursive: true })
+  const store = layout(root, 'win32')
+  assert.deepEqual({ records: store.records, agentSessions: store.agentSessions, desktop: store.desktop, cookies: store.cookies, localState: store.localState, state: store.state, logs: store.logs, login: store.login },
+    { records: path.join(packaged, 'Claude', 'claude-code-sessions'), agentSessions: path.join(packaged, 'Claude', 'local-agent-mode-sessions'), desktop: path.join(packaged, 'Claude', 'config.json'),
+      cookies: path.join(packaged, 'Claude', 'Network', 'Cookies'), localState: path.join(packaged, 'Claude', 'Local State'), state: path.join(packaged, 'claude-transplant'),
+      logs: path.join(root, 'AppData', 'Local', 'Claude', 'Logs'), login: path.join(root, '.claude.json') })
+  assert.equal(layout(root, 'darwin').records, path.join(root, 'Library/Application Support/Claude/claude-code-sessions'))
+})
+
+test('accounts count the sessions the Store build keeps in its package folder, not a stale roaming copy', { skip: process.platform !== 'win32' }, async () => {
+  const h = await home()
+  for (const sid of [id(9601), id(9602)]) await h.record('P', sid)
+  await h.record('T', id(9603))
+  const counts = async () => JSON.parse((await cli(h.root, ['accounts', '--json'])).stdout).map(row => `${row.account}/${row.org}=${row.sessions}`).sort()
+  const before = await counts()
+  assert.ok(before.includes(`${h.acct.P}/${h.org.P}=2`), before.join(' '))
+  const roamingClaude = path.join(h.root, 'AppData', 'Roaming', 'Claude')
+  const packagedClaude = path.join(h.root, 'AppData', 'Local', 'Packages', 'Claude_pzs8sxrjxfjjc', 'LocalCache', 'Roaming', 'Claude')
+  await mkdir(path.dirname(packagedClaude), { recursive: true })
+  await rename(roamingClaude, packagedClaude)
+  await mkdir(path.join(roamingClaude, 'claude-code-sessions'), { recursive: true })
+  await writeFile(path.join(roamingClaude, 'config.json'), JSON.stringify({ lastKnownAccountUuid: h.acct.T }))
+  assert.deepEqual(await counts(), before)
+})
+
 test('Windows process identity separates Desktop helpers, descendants, external workers, and reused pids', () => {
   const desktop = 'C:\\Program Files\\WindowsApps\\Claude_4.4212.0.0_x64__pzs8sxrjxfjjc\\app\\claude.exe'
   const worker = 'C:\\Users\\fixture\\AppData\\Roaming\\Claude\\claude-code\\2.1.309\\9078b9c1d466\\claude.exe'
@@ -11798,6 +11830,41 @@ test('Windows tray installation builds once, starts at sign-in and removes clean
   const snapshot = await cli(h.root, ['menubar', '--snapshot', path.join(h.root, 'panel.png')], setup)
   assert.notEqual(snapshot.code, 0)
   assert.match(snapshot.stderr + snapshot.stdout, /snapshot.*macOS/)
+})
+
+test('with the Store build the tray lives beside Desktop data and a roaming tray from an older install is cleared', { skip: process.platform !== 'win32' }, async () => {
+  const h = await home()
+  const packaged = path.join(h.root, 'AppData', 'Local', 'Packages', 'Claude_pzs8sxrjxfjjc', 'LocalCache', 'Roaming')
+  await mkdir(packaged, { recursive: true })
+  await rename(path.join(h.root, 'AppData', 'Roaming', 'Claude'), path.join(packaged, 'Claude'))
+  const legacy = path.join(h.root, 'AppData', 'Roaming', 'claude-transplant')
+  await mkdir(path.join(legacy, 'tray'), { recursive: true })
+  await writeFile(path.join(legacy, 'tray', 'Claude Transplant.exe'), 'older tray')
+  await writeFile(path.join(legacy, '2026-11-01T00-00-00-000.json'), '{}')
+  const shortcuts = path.join(h.root, 'native-shortcuts.txt')
+  const setup = `
+    import { appendFileSync, writeFileSync } from 'node:fs'
+    const syntheticSpawn = childProcess.spawnSync, syntheticAsync = childProcess.spawn
+    childProcess.spawnSync = (file, args, ...rest) => {
+      if (/csc\\.exe$/i.test(file)) { writeFileSync(args.find(arg => arg.startsWith('-out:')).slice(5), 'synthetic tray'); return { status: 0, stdout: '', stderr: '' } }
+      if (/taskkill\\.exe$/i.test(file)) return { status: 0, stdout: '', stderr: '' }
+      if (/powershell\\.exe$/i.test(file) && /WScript\\.Shell/.test(args.at(-1))) { appendFileSync(${JSON.stringify(shortcuts)}, args.at(-1) + '\\n'); return { status: 0, stdout: '', stderr: '' } }
+      return syntheticSpawn(file, args, ...rest)
+    }
+    childProcess.spawn = (file, args, ...rest) => /Claude Transplant\\.exe$/i.test(file) ? { unref: () => {}, on: () => {}, once: () => {} } : syntheticAsync(file, args, ...rest)
+  `
+  const installed = await cli(h.root, ['menubar'], setup)
+  assert.equal(installed.code, 0, installed.stderr)
+  const tray = path.join(packaged, 'claude-transplant', 'tray')
+  assert.equal(await readFile(path.join(tray, 'Claude Transplant.exe'), 'utf8'), 'synthetic tray')
+  assert.ok((await readFile(shortcuts, 'utf8')).includes(path.join(tray, 'Claude Transplant.exe')))
+  assert.equal(await stat(path.join(legacy, 'tray')).catch(() => null), null)
+  assert.equal(await readFile(path.join(legacy, '2026-11-01T00-00-00-000.json'), 'utf8'), '{}')
+  await mkdir(path.join(legacy, 'tray'), { recursive: true })
+  const removed = await cli(h.root, ['menubar', '--remove'], setup)
+  assert.equal(removed.code, 0, removed.stderr)
+  assert.equal(await stat(tray).catch(() => null), null)
+  assert.equal(await stat(path.join(legacy, 'tray')).catch(() => null), null)
 })
 
 test('the Windows tray compiles and describes accounts, sessions and waiting work', { skip: process.platform !== 'win32' }, async () => {
