@@ -129,7 +129,7 @@ class Tray : ApplicationContext {
     public Tray(Config config) {
         this.config = config;
         ui.CreateControl();
-        icon.Icon = SystemIcons.Application;
+        icon.Icon = Glyph();
         icon.Text = "Claude Transplant";
         icon.ContextMenuStrip = menu;
         icon.Visible = true;
@@ -137,6 +137,20 @@ class Tray : ApplicationContext {
         menu.Opening += (sender, e) => Build();
         Build();
         Refresh();
+    }
+
+    static Icon Glyph() {
+        using (var bitmap = new Bitmap(32, 32))
+        using (var canvas = Graphics.FromImage(bitmap))
+        using (var disc = new SolidBrush(Color.FromArgb(37, 99, 235)))
+        using (var arrow = new Pen(Color.White, 3.2f) { EndCap = System.Drawing.Drawing2D.LineCap.ArrowAnchor }) {
+            canvas.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            canvas.Clear(Color.Transparent);
+            canvas.FillEllipse(disc, 1, 1, 30, 30);
+            canvas.DrawLine(arrow, 8, 12, 23, 12);
+            canvas.DrawLine(arrow, 24, 20, 9, 20);
+            return Icon.FromHandle(bitmap.GetHicon());
+        }
     }
 
     public static IEnumerable<string> Describe(List<Account> accounts) {

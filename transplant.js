@@ -5227,7 +5227,7 @@ async function windowsTray(paths, remove, snapshot) {
   const stop = () => spawnSync(windowsSystem('System32', 'taskkill.exe'), ['/F', '/IM', 'Claude Transplant.exe'], { stdio: 'ignore', windowsHide: true })
   if (remove) {
     stop()
-    await rm(tray, { recursive: true, force: true })
+    await rm(tray, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
     await rm(shortcut, { force: true })
     return 'tray removed'
   }
@@ -5247,7 +5247,7 @@ async function windowsTray(paths, remove, snapshot) {
   }
   stop()
   if (rebuild) {
-    await rm(tray, { recursive: true, force: true })
+    await rm(tray, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
     await rename(fresh, tray)
   }
   const script = path.join(tray, 'transplant.js')
