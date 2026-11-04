@@ -249,12 +249,41 @@ test('layout follows the Microsoft Store build of Claude Desktop into its packag
   assert.equal(layout(root, 'win32').records, path.join(roaming, 'Claude', 'claude-code-sessions'))
   assert.equal(layout(root, 'win32').state, path.join(roaming, 'claude-transplant'))
   await mkdir(path.join(packaged, 'Claude'), { recursive: true })
+  assert.equal(layout(root, 'win32').records, path.join(roaming, 'Claude', 'claude-code-sessions'))
+  await writeFile(path.join(packaged, 'Claude', 'config.json'), '{}')
   const store = layout(root, 'win32')
   assert.deepEqual({ records: store.records, agentSessions: store.agentSessions, desktop: store.desktop, cookies: store.cookies, localState: store.localState, state: store.state, logs: store.logs, login: store.login },
     { records: path.join(packaged, 'Claude', 'claude-code-sessions'), agentSessions: path.join(packaged, 'Claude', 'local-agent-mode-sessions'), desktop: path.join(packaged, 'Claude', 'config.json'),
       cookies: path.join(packaged, 'Claude', 'Network', 'Cookies'), localState: path.join(packaged, 'Claude', 'Local State'), state: path.join(packaged, 'claude-transplant'),
       logs: path.join(root, 'AppData', 'Local', 'Claude', 'Logs'), login: path.join(root, '.claude.json') })
   assert.equal(layout(root, 'darwin').records, path.join(root, 'Library/Application Support/Claude/claude-code-sessions'))
+})
+
+test('layout follows Desktop data relocated to Claude-Data and reads the newest Desktop log', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ct-relocated-'))
+  const local = path.join(root, 'AppData', 'Local')
+  const packagedClaude = path.join(local, 'Packages', 'Claude_pzs8sxrjxfjjc', 'LocalCache', 'Roaming', 'Claude')
+  const relocated = path.join(local, 'Claude-Data', 'claude_pzs8sxrjxfjjc')
+  await mkdir(path.join(packagedClaude, 'claude-code-sessions'), { recursive: true })
+  await writeFile(path.join(packagedClaude, 'config.json'), '{}')
+  await mkdir(path.join(local, 'Claude-Data', 'unrelated'), { recursive: true })
+  assert.equal(layout(root, 'win32').records, path.join(packagedClaude, 'claude-code-sessions'))
+  await mkdir(path.join(relocated, 'claude-code-sessions'), { recursive: true })
+  const moved = layout(root, 'win32')
+  assert.deepEqual({ records: moved.records, agentSessions: moved.agentSessions, desktop: moved.desktop, cookies: moved.cookies, localState: moved.localState, state: moved.state },
+    { records: path.join(relocated, 'claude-code-sessions'), agentSessions: path.join(relocated, 'local-agent-mode-sessions'), desktop: path.join(relocated, 'config.json'),
+      cookies: path.join(relocated, 'Network', 'Cookies'), localState: path.join(relocated, 'Local State'), state: path.join(local, 'Claude-Data', 'claude-transplant') })
+  const sharedLogs = path.join(local, 'Claude', 'Logs'), profileLogs = path.join(relocated, 'logs')
+  assert.equal(moved.logs, sharedLogs)
+  await mkdir(sharedLogs, { recursive: true })
+  await mkdir(profileLogs, { recursive: true })
+  await writeFile(path.join(sharedLogs, 'main.log'), 'older\r\n')
+  await writeFile(path.join(profileLogs, 'main.log'), 'newer\r\n')
+  const hourAgo = new Date(Date.now() - 3600000)
+  await fs.utimes(path.join(sharedLogs, 'main.log'), hourAgo, hourAgo)
+  assert.equal(layout(root, 'win32').logs, profileLogs)
+  await fs.utimes(path.join(profileLogs, 'main.log'), new Date(Date.now() - 7200000), new Date(Date.now() - 7200000))
+  assert.equal(layout(root, 'win32').logs, sharedLogs)
 })
 
 test('accounts count the sessions the Store build keeps in its package folder, not a stale roaming copy', { skip: process.platform !== 'win32' }, async () => {
@@ -270,6 +299,12 @@ test('accounts count the sessions the Store build keeps in its package folder, n
   await rename(roamingClaude, packagedClaude)
   await mkdir(path.join(roamingClaude, 'claude-code-sessions'), { recursive: true })
   await writeFile(path.join(roamingClaude, 'config.json'), JSON.stringify({ lastKnownAccountUuid: h.acct.T }))
+  assert.deepEqual(await counts(), before)
+  const relocatedClaude = path.join(h.root, 'AppData', 'Local', 'Claude-Data', 'claude_pzs8sxrjxfjjc')
+  await mkdir(path.dirname(relocatedClaude), { recursive: true })
+  await fs.cp(packagedClaude, relocatedClaude, { recursive: true })
+  await fs.rm(path.join(packagedClaude, 'claude-code-sessions'), { recursive: true })
+  await mkdir(path.join(packagedClaude, 'claude-code-sessions'))
   assert.deepEqual(await counts(), before)
 })
 
@@ -11873,6 +11908,17 @@ test('with the Store build the tray lives beside Desktop data and a roaming tray
     assert.equal(await readFile(path.join(tray, 'Claude Transplant.exe'), 'utf8'), 'synthetic tray')
     assert.equal(await readFile(path.join(tray, 'transplant.js'), 'utf8'), await readFile(path.join(here, 'transplant.js'), 'utf8'))
   }
+  const relocated = path.join(h.root, 'AppData', 'Local', 'Claude-Data')
+  await mkdir(path.join(relocated, 'claude_pzs8sxrjxfjjc', 'claude-code-sessions'), { recursive: true })
+  const moved = await cli(h.root, ['menubar'], setup)
+  assert.equal(moved.code, 0, moved.stderr)
+  const relocatedTray = path.join(relocated, 'claude-transplant', 'tray')
+  assert.equal(await readFile(path.join(relocatedTray, 'Claude Transplant.exe'), 'utf8'), 'synthetic tray')
+  assert.ok((await readFile(shortcuts, 'utf8')).trim().split('\n').at(-1).includes(path.join(relocatedTray, 'Claude Transplant.exe')))
+  assert.equal(await stat(tray).catch(() => null), null)
+  const relocatedRemoved = await cli(h.root, ['menubar', '--remove'], setup)
+  assert.equal(relocatedRemoved.code, 0, relocatedRemoved.stderr)
+  assert.equal(await stat(relocatedTray).catch(() => null), null)
 })
 
 test('the Windows tray compiles and describes accounts, sessions and waiting work', { skip: process.platform !== 'win32' }, async () => {
