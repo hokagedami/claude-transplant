@@ -161,7 +161,7 @@ To    ↑↓ move · enter confirm
 
 ## What each command touches
 
-Every command may write the tool's own folder, `~/Library/Application Support/claude-transplant` on macOS. On Windows it sits beside Desktop's data: `%LOCALAPPDATA%\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Roaming\claude-transplant` with the packaged (MSIX) Desktop, or `%APPDATA%\claude-transplant` when that package folder doesn't exist. It holds cache, lock, restart plan and diagnostics, receipts, quarantine and drift evidence. A move, `finish`, `sweep`, `undo` and `restart` first finish interrupted work, which can move records, rewrite the receipt and reopen Claude Desktop. `--dry-run` and `keep-local` refuse during recovery.
+Every command may write the tool's own folder, `~/Library/Application Support/claude-transplant` on macOS. On Windows it sits beside Desktop's data folder, so it is `%LOCALAPPDATA%\Claude-Data\claude-transplant`, `%LOCALAPPDATA%\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Roaming\claude-transplant` or `%APPDATA%\claude-transplant` (see How it works). It holds cache, lock, restart plan and diagnostics, receipts, quarantine and drift evidence. A move, `finish`, `sweep`, `undo` and `restart` first finish interrupted work, which can move records, rewrite the receipt and reopen Claude Desktop. `--dry-run` and `keep-local` refuse during recovery.
 
 | Command | Beyond the tool's own folder |
 |---|---|
@@ -254,7 +254,11 @@ Remote Control (`--cloud`):
 
 Windows:
 
-- Desktop's data folder holds records, config and cookies. The packaged Desktop, MSIX `Claude_pzs8sxrjxfjjc` 4.16336.0 on both machines checked, runs with MSIX file virtualization, so its writes to `%APPDATA%\Claude` land in `%LOCALAPPDATA%\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Roaming\Claude`. Processes outside the package see only the real `%APPDATA%\Claude`, which is missing or stale, while Claude Code inside Desktop sees both merged. The tool uses the package folder whenever it exists, so the CLI, the tray at sign-in and Claude Code inside Desktop all read and write the same files. Without the package folder it uses `%APPDATA%\Claude`. Desktop exempts its logs from virtualization, and 4.4212.0 logs to `%LOCALAPPDATA%\Claude\Logs` with CRLF line endings. The older `%APPDATA%\Claude\logs` stops at the version that moved them.
+- Desktop's data folder holds records, config, cookies and `Local State`, and its place differs between installs of the same Desktop. Two machines with MSIX `Claude_pzs8sxrjxfjjc` 4.16336.0 used two places:
+  - `%LOCALAPPDATA%\Claude-Data\claude_pzs8sxrjxfjjc`, which Desktop was launched with as `--user-data-dir`. The package exempts `Claude-Data` from file virtualization.
+  - `%LOCALAPPDATA%\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Roaming\Claude`. Here Desktop wrote to `%APPDATA%\Claude` under MSIX file virtualization, which redirects into the package folder. Processes outside the package see only the real `%APPDATA%\Claude`, missing or stale, while Claude Code inside Desktop sees both merged.
+- The tool takes the first of `Claude-Data\<profile>`, the package's `LocalCache\Roaming\Claude` and `%APPDATA%\Claude` that holds `config.json` or `claude-code-sessions`, read through its real path. The CLI, the tray at sign-in and Claude Code inside Desktop then use the same files, and a stale copy left by an earlier location is never preferred.
+- Logs are exempt from virtualization. 4.4212.0 logs to `%LOCALAPPDATA%\Claude\Logs` with CRLF line endings, and a data folder can carry its own `logs`. The tool reads whichever `main.log` is newer. The older `%APPDATA%\Claude\logs` stops at the version that moved them.
 - Processes come from `Win32_Process`. Desktop's Electron helpers share its `claude.exe` and carry `--type=`, so they are neither Desktop nor workers. Code workers register as `win32:<host>` with a FILETIME start, matched to the millisecond.
 - Desktop quits through Restart Manager for its exact PID and start time, the request Desktop builds from August and September 2026 logged as "Windows session ending (close-app) - quitting the app". It is never killed. It reopens through its Store app id, or its `claude.exe` for other installs.
 - The kernel lock is an exclusive handle held by a PowerShell helper and released when it exits.
@@ -353,6 +357,6 @@ The active badge comes from Desktop's own `main.log`, with no Keychain read or n
 | 4.1.5 | 27.0.1 | 3.6556.2 | 2.1.308 | 2026-10-26 |
 | 4.1.4 | 27.0.1 | 3.6556.2 | 2.1.308 | 2026-10-26 |
 
-4.1.5 and 4.1.6 were validated with synthetic fixtures and read-only code inspection, without a new live move. The Windows row passed the full suite and read-only checks against a live Desktop, accounts, signed-in identity, the process table, the user agent and the locked cookie store, without a live move. 4.2.0 moved 499 sessions to another account and back through the menubar, and its final panel was checked with state tests and renders of live data.
+4.1.5 and 4.1.6 were validated with synthetic fixtures and read-only code inspection, without a new live move. The Windows row passed the full suite and read-only checks against a live Desktop, accounts, signed-in identity, the process table, the user agent and the locked cookie store, without a live move. On Desktop 4.16336.0 the data folder lookup was checked on two machines, one using `Claude-Data` and one using the package folder, by listing accounts and session counts from outside Desktop and installing the tray, without a live move. 4.2.0 moved 499 sessions to another account and back through the menubar, and its final panel was checked with state tests and renders of live data.
 
 Delete `quarantine` once its receipts are no longer wanted. A kernel lock prevents overlapping runs. MIT.
